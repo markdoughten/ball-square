@@ -9,7 +9,6 @@ import matplotlib.patches as patches
 import mujoco
 import glfw
 import os
-import torch
 from datetime import datetime
 
 class ActorNetwork(nn.Module):
@@ -45,10 +44,12 @@ class CriticNetwork(nn.Module):
         self.fc3 = nn.Linear(hidden_dim2, hidden_dim3)
         self.fc_value = nn.Linear(hidden_dim3, 1)
         self.initialize_weights()
+    
     def initialize_weights(self):
         for layer in [self.fc1, self.fc2, self.fc3, self.fc_value]:
             nn.init.xavier_uniform_(layer.weight)
             nn.init.zeros_(layer.bias)
+
     def forward(self, state):
         x = torch.relu(self.fc1(state))
         x = torch.relu(self.fc2(x))
@@ -68,7 +69,6 @@ class ActorCriticModel(nn.Module):
         return mu, sigma, value
 
 def init_mujoco_render(model):
-    
     if not glfw.init():
         raise Exception("Could not initialize GLFW")
 
@@ -84,6 +84,7 @@ def init_mujoco_render(model):
     viewport = mujoco.MjrRect(0, 0, 800, 600)
     option = mujoco.MjvOption()
 
+    # Adjust camera view
     camera.azimuth = 0
     camera.elevation = -90
     camera.distance = 2.0
@@ -92,23 +93,18 @@ def init_mujoco_render(model):
     return window, camera, scene, context, viewport, option
 
 def render_mujoco_scene(model, data, scene, context, viewport, camera, window, option):
-    
     mujoco.mjv_updateScene(model, data, option, None, camera, mujoco.mjtCatBit.mjCAT_ALL.value, scene)
     mujoco.mjr_render(viewport, scene, context)
     glfw.swap_buffers(window)
     glfw.poll_events()
-    
     return
 
 def sample_action(mu, sigma):
-    
     dist = torch.distributions.Normal(mu, sigma)
     action = dist.sample()
-    
     return action.clamp(-1, 1), dist
 
 def transition(state, action, dt=0.01):
-    
     x, y, vx, vy = state
     fx, fy = action
     noise_x, noise_y = np.random.normal(0, 0.1, 2)
@@ -116,7 +112,6 @@ def transition(state, action, dt=0.01):
     new_vy = vy + (fy - noise_y) * dt
     new_x = x + new_vx * dt
     new_y = y + new_vy * dt
-
     return np.array([new_x, new_y, new_vx, new_vy])
 
 def actor_critic_training(
@@ -136,80 +131,89 @@ def actor_critic_training(
     plot=False,
     epsilon=0.2,
     fixed=False,
-    log=True):
-    
+    log=True,
+    device=torch.device("cpu")  # <-- Device parameter
+):
+    """
+    Train the Actor-Critic Model on the selected device (CPU or GPU).
+    """
     starting_positions = []
     episode_rewards = []
     actor_losses = []
     critic_losses = []
 
-    if render:
+    if render and mujoco_model is not None:
         window, camera, scene, context, viewport, option = init_mujoco_render(mujoco_model)
 
     goal_state = np.array([goal_position[0], goal_position[1], 0.0, 0.0])
     
     for episode in range(num_episodes):
-        
+        # Pick random or fixed initial position
         if fixed:
             state = np.array([0.0, 0.0, 0.0, 0.0])
         else:
             state = random_position(walls, outside_walls, goal_position)
-            
+
         starting_positions.append(state[:2])
+        
+        # If MuJoCo is used, place the ball in MuJoCo as well
         if mujoco_model is not None and mujoco_data is not None:
             mujoco_data.qpos[0:2] = state[0:2]
             mujoco_data.qvel[0:2] = state[2:4]
             mujoco.mj_forward(mujoco_model, mujoco_data)
 
         total_reward = 0
-        prev_state = state
         
         for t in range(max_steps):
-
-            # forward pass to get action and value
             critic_optimizer.zero_grad()
             actor_optimizer.zero_grad()
-            
-            state_tensor = torch.tensor(state, dtype=torch.float32)
+
+            # Move state to GPU/CPU device
+            state_tensor = torch.tensor(state, dtype=torch.float32, device=device)
+
+            # Forward pass
             mu, sigma, value = model(state_tensor)
             action, dist = sample_action(mu, sigma)
             log_prob = dist.log_prob(action).sum()
 
-            # apply action in mujoco to the ball
+            # Action on CPU for environment
+            action_cpu = action.detach().cpu().numpy()
+
+            # Apply action in MuJoCo or custom transition
             if mujoco_model is not None and mujoco_data is not None:
                 ball_body_id = mujoco.mj_name2id(mujoco_model, mujoco.mjtObj.mjOBJ_BODY, "ball")
-                mujoco_data.xfrc_applied[ball_body_id, :2] = action.detach().numpy()
+                mujoco_data.xfrc_applied[ball_body_id, :2] = action_cpu
                 mujoco.mj_step(mujoco_model, mujoco_data)
                 next_state = np.hstack((mujoco_data.qpos[0:2], mujoco_data.qvel[0:2]))
             else:
-                # optional use the custom transition function
-                next_state = transition(state, action.detach().numpy())
+                next_state = transition(state, action_cpu)
 
-            # calculate reward
+            # Calculate reward
             reward = calculate_reward(state, goal_position, epsilon, t)
-
-            # update total reward
             total_reward += reward
             done = np.linalg.norm(next_state[:2] - goal_position) <= epsilon
-            next_state_tensor = torch.tensor(next_state, dtype=torch.float32)
 
-            # compute value of next state
+            # Next state
+            next_state_tensor = torch.tensor(next_state, dtype=torch.float32, device=device)
+            
+            # Compute next state's value (no gradient needed)
             with torch.no_grad():
                 next_value = model.critic(next_state_tensor)
 
             td_target = reward + gamma * next_value
             advantage = td_target - value
+
             critic_loss = F.mse_loss(value, td_target.detach())
-            
             actor_loss = -(advantage.detach() * log_prob).mean()
+
             actor_losses.append(actor_loss.item())
-            critic_losses.append(critic_loss.item()) 
-            
-            # backpropagation
+            critic_losses.append(critic_loss.item())
+
+            # Backpropagation
             critic_loss.backward()
             actor_loss.backward()
 
-            # optimizer steps
+            # Optimizer step
             critic_optimizer.step()
             actor_optimizer.step()
 
@@ -217,24 +221,25 @@ def actor_critic_training(
                 print(f"Episode {episode}, Step {t}")
                 print(f"  - TD Error: {advantage.item()}")
                 print(f"  - Critic Loss: {critic_loss.item()}, Actor Loss: {actor_loss.item()}")
-                print(f"  - Action Mean: {mu}, Action Std: {sigma}")
-                print(f"  - Action Taken: {action}")
+                print(f"  - Action Mean: {mu.detach().cpu().numpy()}, Action Std: {sigma.detach().cpu().numpy()}")
+                print(f"  - Action Taken: {action_cpu}")
 
+            # Render if requested
             if render and mujoco_model is not None and mujoco_data is not None:
                 render_mujoco_scene(mujoco_model, mujoco_data, scene, context, viewport, camera, window, option)
 
             if done:
                 break
             
-            prev_state = state
             state = next_state
 
-        # store the total reward for the episode
-        episode_rewards.append(total_reward/(t+1) if t > 0 else 0)
+        # Store the total reward (averaged per step if you wish)
+        episode_rewards.append(total_reward / (t + 1) if t > 0 else 0)
+
         if episode % log_interval == 0:
             print(f"Episode {episode}, Total Reward: {total_reward}")
 
-    if render:
+    if render and mujoco_model is not None:
         glfw.terminate()
 
     if plot:
@@ -245,17 +250,14 @@ def actor_critic_training(
     return model
 
 def calculate_reward(state, goal_position, epsilon, t):
-    
     distance_to_goal = np.linalg.norm(state[:2] - goal_position)
     reward = -distance_to_goal * 2
     if distance_to_goal <= epsilon:
         reward += 6500
     reward -= 1e-2 * t
-
     return reward
 
 def random_position(walls, outside_walls, goal_position):
-    
     x_min = outside_walls['x_min'] 
     x_max = outside_walls['x_max']
     y_min = outside_walls['y_min']
@@ -265,51 +267,47 @@ def random_position(walls, outside_walls, goal_position):
         x = random.uniform(x_min, x_max)
         y = random.uniform(y_min, y_max)
         vx, vy = 0.0, 0.0
-        position = np.array([x, y])
         if not is_inside_wall(x, y, walls, outside_walls):
             return np.array([x, y, vx, vy])
 
 def is_inside_wall(x, y, walls, outside_walls):
-    
     safety_margin = 0.075
+    # Outside boundary
     if not (outside_walls['x_min'] + safety_margin <= x <= outside_walls['x_max'] - safety_margin and
             outside_walls['y_min'] + safety_margin <= y <= outside_walls['y_max'] - safety_margin):
         return True
+    # Inside the internal wall
     if (walls['x_min'] - safety_margin <= x <= walls['x_max'] + safety_margin and
             walls['y_min'] - safety_margin <= y <= walls['y_max'] + safety_margin):
         return True
     return False
 
 def plot_loss_curve(critic_losses, actor_losses):
-     
-     plt.figure(figsize=(12, 6))
-     plt.plot(critic_losses, label="Critic Loss", alpha=0.7)
-     plt.plot(actor_losses, label="Actor Loss", alpha=0.7)
-     plt.xlabel("Training Steps")
-     plt.ylabel("Loss")
-     plt.title("Critic and Actor Loss Over Training")
-     plt.legend()
-     plt.show()
-     
-     return
+    plt.figure(figsize=(12, 6))
+    plt.plot(critic_losses, label="Critic Loss", alpha=0.7)
+    plt.plot(actor_losses, label="Actor Loss", alpha=0.7)
+    plt.xlabel("Training Steps")
+    plt.ylabel("Loss")
+    plt.title("Critic and Actor Loss Over Training")
+    plt.legend()
+    plt.show()
+    return
 
 def plot_learning_curve(episode_rewards):
-
-    window_size = 10  # Adjust this for smoothing (e.g., 10 episodes)
+    window_size = 10  # Adjust for smoothing
     moving_avg_rewards = np.convolve(episode_rewards, np.ones(window_size) / window_size, mode='valid')
     plt.figure(figsize=(10, 6))
     plt.plot(episode_rewards, label="Avg. Reward per Episode", alpha=0.5)
-    plt.plot(range(window_size - 1, len(episode_rewards)), moving_avg_rewards, label=f"Moving Average (window={window_size})", color='orange')
+    plt.plot(range(window_size - 1, len(episode_rewards)), moving_avg_rewards,
+             label=f"Moving Average (window={window_size})", color='orange')
     plt.xlabel("Episode")
     plt.ylabel("Avg. Reward")
     plt.title("Learning Curve with Moving Average")
     plt.legend()
     plt.show()
-
     return 
 
 def plot_starting_points(starting_positions, goal_position, outside_walls, wall, epsilon):
-
     plt.figure(figsize=(10, 8))
     starting_positions = np.array(starting_positions)
     plt.scatter(starting_positions[:, 0], starting_positions[:, 1], color='blue', label='Starting Positions')
@@ -324,6 +322,7 @@ def plot_starting_points(starting_positions, goal_position, outside_walls, wall,
     boundary = patches.Rectangle((x_min, y_min), x_max - x_min, y_max - y_min,
                                   edgecolor="black", facecolor="none", linewidth=2, label="Outside Walls")
     plt.gca().add_patch(boundary)
+
     x_min = wall['x_min']
     x_max = wall['x_max']
     y_min = wall['y_min']
@@ -339,23 +338,31 @@ def plot_starting_points(starting_positions, goal_position, outside_walls, wall,
     plt.grid(True)
     plt.axis("equal")
     plt.show()
-
     return
 
 def main():
     
+    # Select device: GPU if available, otherwise CPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
     goal_position = np.array([0.8, 0.0])  
     epsilon = 0.1
     total_episodes = 0
+
+    # Walls and environment bounds
     walls = {"x_min": 0.5, "x_max": 0.6, "y_min": -0.15, "y_max": 0.15}
     outside_walls = {"x_min": -0.2, "x_max": 1.1, "y_min": -0.36, "y_max": 0.36}     
 
+    # Load MuJoCo model
     mujoco_model = mujoco.MjModel.from_xml_path("ball_square.xml")
     mujoco_model.opt.timestep = 0.1
     mujoco_data = mujoco.MjData(mujoco_model)
-    model = ActorCriticModel(input_dim=4, hidden_dim1=32, hidden_dim2=64, hidden_dim3=32, action_dim=2)
-    
-    # optimize the parameters
+
+    # Create and move Actor-Critic Model to the chosen device
+    model = ActorCriticModel(input_dim=4, hidden_dim1=32, hidden_dim2=64, hidden_dim3=32, action_dim=2).to(device)
+
+    # Optimizers
     actor_optimizer = optim.Adam(model.actor.parameters(), lr=1e-5)
     critic_optimizer = optim.Adam(model.critic.parameters(), lr=1e-5)
    
@@ -391,9 +398,11 @@ def main():
                 mujoco_model=mujoco_model,
                 mujoco_data=mujoco_data,
                 epsilon=epsilon,
-                fixed=False
+                fixed=False,
+                device=device  # pass device here
             )
             total_episodes += num_training_episodes
+
         elif choice == 2:
             print("Training the network...")
             num_training_episodes = 360
@@ -411,9 +420,11 @@ def main():
                 gamma=0.99,
                 log_interval=1,
                 plot=True,
-                epsilon=epsilon
+                epsilon=epsilon,
+                device=device  # pass device here
             )
             total_episodes += num_training_episodes
+
         elif choice == 3:
             print("Rendering with fixed starting position...")
             num_training_episodes = 1
@@ -432,9 +443,11 @@ def main():
                 mujoco_model=mujoco_model,
                 mujoco_data=mujoco_data,
                 epsilon=epsilon,
-                fixed=True
+                fixed=True,
+                device=device  # pass device here
             )
             total_episodes += num_training_episodes
+
         elif choice == 4:
             print("Goodbye!")
             break
@@ -443,3 +456,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

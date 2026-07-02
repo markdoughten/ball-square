@@ -4,3 +4,12 @@ __pycache__
 .venv/
 *.pt
 report/images/gpu/optimization_*/
+
+# LaTeX auxiliary files
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc

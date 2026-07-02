@@ -249,6 +249,136 @@ def actor_critic_training(
 
     return model
 
+def actor_critic_batch_training(
+    model,
+    goal_position,
+    walls,
+    outside_walls,
+    actor_optimizer,
+    critic_optimizer,
+    num_episodes=360,
+    batch_size=64,
+    max_steps=1800,
+    gamma=0.99,
+    mujoco_model=None,
+    epsilon=0.2,
+    plot=False,
+    device=torch.device("cpu")
+):
+    """Train independent environments in parallel neural-network batches."""
+    starting_positions = []
+    episode_rewards = []
+    actor_losses = []
+    critic_losses = []
+
+    for batch_start in range(0, num_episodes, batch_size):
+        current_batch_size = min(batch_size, num_episodes - batch_start)
+        states = np.stack([
+            random_position(walls, outside_walls, goal_position)
+            for _ in range(current_batch_size)
+        ])
+        starting_positions.extend(states[:, :2])
+
+        mujoco_batch = None
+        if mujoco_model is not None:
+            mujoco_batch = [mujoco.MjData(mujoco_model) for _ in range(current_batch_size)]
+            for state, data in zip(states, mujoco_batch):
+                data.qpos[0:2] = state[0:2]
+                data.qvel[0:2] = state[2:4]
+                mujoco.mj_forward(mujoco_model, data)
+            ball_body_id = mujoco.mj_name2id(
+                mujoco_model, mujoco.mjtObj.mjOBJ_BODY, "ball"
+            )
+
+        active = np.ones(current_batch_size, dtype=bool)
+        total_rewards = np.zeros(current_batch_size, dtype=np.float64)
+        step_counts = np.zeros(current_batch_size, dtype=np.int32)
+
+        for t in range(max_steps):
+            active_indices = np.flatnonzero(active)
+            if active_indices.size == 0:
+                break
+
+            state_tensor = torch.as_tensor(
+                states[active_indices], dtype=torch.float32, device=device
+            )
+            mu, sigma, values = model(state_tensor)
+            actions, dist = sample_action(mu, sigma)
+            log_probs = dist.log_prob(actions).sum(dim=-1)
+            actions_cpu = actions.detach().cpu().numpy()
+
+            next_states = np.empty_like(states[active_indices])
+            if mujoco_batch is not None:
+                for local_index, (env_index, action) in enumerate(
+                    zip(active_indices, actions_cpu)
+                ):
+                    data = mujoco_batch[env_index]
+                    data.xfrc_applied[ball_body_id, :2] = action
+                    mujoco.mj_step(mujoco_model, data)
+                    next_states[local_index] = np.hstack(
+                        (data.qpos[0:2], data.qvel[0:2])
+                    )
+            else:
+                next_states = np.stack([
+                    transition(state, action)
+                    for state, action in zip(states[active_indices], actions_cpu)
+                ])
+
+            distances = np.linalg.norm(
+                states[active_indices, :2] - goal_position, axis=1
+            )
+            rewards = -distances * 2 - 1e-2 * t
+            rewards += (distances <= epsilon) * 6500
+            done = np.linalg.norm(
+                next_states[:, :2] - goal_position, axis=1
+            ) <= epsilon
+
+            reward_tensor = torch.as_tensor(
+                rewards, dtype=torch.float32, device=device
+            )
+            done_tensor = torch.as_tensor(done, dtype=torch.bool, device=device)
+            with torch.no_grad():
+                next_values = model.critic(
+                    torch.as_tensor(next_states, dtype=torch.float32, device=device)
+                ).squeeze(-1)
+                td_targets = reward_tensor + gamma * next_values * (~done_tensor)
+
+            values = values.squeeze(-1)
+            advantages = td_targets - values
+            critic_loss = F.mse_loss(values, td_targets)
+            actor_loss = -(advantages.detach() * log_probs).mean()
+
+            critic_optimizer.zero_grad()
+            actor_optimizer.zero_grad()
+            critic_loss.backward()
+            actor_loss.backward()
+            critic_optimizer.step()
+            actor_optimizer.step()
+
+            actor_losses.append(actor_loss.item())
+            critic_losses.append(critic_loss.item())
+            total_rewards[active_indices] += rewards
+            step_counts[active_indices] += 1
+            states[active_indices] = next_states
+            active[active_indices[done]] = False
+
+        averaged_rewards = total_rewards / np.maximum(step_counts, 1)
+        episode_rewards.extend(averaged_rewards.tolist())
+        completed = batch_start + current_batch_size
+        print(
+            f"Completed {completed}/{num_episodes} episodes; "
+            f"batch mean reward: {averaged_rewards.mean():.3f}"
+        )
+
+    if plot:
+        plot_starting_points(
+            starting_positions, goal_position, outside_walls, walls, epsilon
+        )
+        plot_learning_curve(episode_rewards)
+        plot_loss_curve(critic_losses, actor_losses)
+
+    return model
+
 def calculate_reward(state, goal_position, epsilon, t):
     distance_to_goal = np.linalg.norm(state[:2] - goal_position)
     reward = -distance_to_goal * 2
@@ -406,7 +536,7 @@ def main():
         elif choice == 2:
             print("Training the network...")
             num_training_episodes = 360
-            model = actor_critic_training(
+            model = actor_critic_batch_training(
                 model=model,
                 goal_position=goal_position,
                 walls=walls,
@@ -414,14 +544,12 @@ def main():
                 actor_optimizer=actor_optimizer,
                 critic_optimizer=critic_optimizer,
                 num_episodes=num_training_episodes,
+                batch_size=64,
                 mujoco_model=mujoco_model,
-                mujoco_data=mujoco_data,
                 max_steps=1800,
                 gamma=0.99,
-                log_interval=1,
                 plot=True,
                 epsilon=epsilon,
-                log=False,
                 device=device  # pass device here
             )
             total_episodes += num_training_episodes

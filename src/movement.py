@@ -421,6 +421,7 @@ def main():
                 log_interval=1,
                 plot=True,
                 epsilon=epsilon,
+                log=False,
                 device=device  # pass device here
             )
             total_episodes += num_training_episodes
@@ -456,4 +457,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

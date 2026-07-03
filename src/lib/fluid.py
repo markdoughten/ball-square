@@ -4,6 +4,8 @@ from dataclasses import dataclass, field as dataclass_field
 
 import mujoco
 import numpy as np
+import torch
+import torch.nn.functional as torch_functional
 
 
 @dataclass(frozen=True)
@@ -235,6 +237,214 @@ class NavierStokesField:
         self._apply_boundaries(self.velocity)
 
 
+class BatchedNavierStokesFluid:
+    """CUDA-batched training fluid with shape ``[batch,z,y,x,3]``."""
+
+    def __init__(
+        self, batch_size, device, region=None, shape=(12, 8, 6),
+        inlet_velocity=(-0.025, 0.0, 0.0), density=997.0,
+        viscosity=8.93e-7, pressure_iterations=6,
+        turbulence_intensity=0.04, vorticity_confinement=0.03,
+        seed=None,
+    ):
+        self.batch_size = batch_size
+        self.device = torch.device(device)
+        self.region = region or FluidRegion()
+        self.nx, self.ny, self.nz = shape
+        self.density = density
+        self.viscosity = viscosity
+        self.pressure_iterations = pressure_iterations
+        self.turbulence_intensity = turbulence_intensity
+        self.vorticity_confinement = vorticity_confinement
+        self.dx = (self.region.x_max-self.region.x_min)/(self.nx-1)
+        self.dy = (self.region.y_max-self.region.y_min)/(self.ny-1)
+        self.dz = (self.region.surface_z-self.region.bottom_z)/(self.nz-1)
+        z, y, x = torch.meshgrid(
+            torch.linspace(self.region.bottom_z, self.region.surface_z, self.nz, device=self.device),
+            torch.linspace(self.region.y_min, self.region.y_max, self.ny, device=self.device),
+            torch.linspace(self.region.x_min, self.region.x_max, self.nx, device=self.device),
+            indexing="ij",
+        )
+        self.x, self.y, self.z = x, y, z
+        self.solid = (
+            (x >= 0.4) & (x <= 0.6) & (y >= -0.15) & (y <= 0.15)
+            & (z <= 0.10)
+        )
+        inlet = torch.as_tensor(inlet_velocity, dtype=torch.float32, device=self.device)
+        self.inlet = inlet.expand(batch_size, 3).clone()
+        self.velocity = self.inlet[:, None, None, None, :].expand(
+            batch_size, self.nz, self.ny, self.nx, 3
+        ).clone()
+        self.pressure = torch.zeros(
+            batch_size, self.nz, self.ny, self.nx, device=self.device
+        )
+        generator = torch.Generator(device=self.device)
+        if seed is not None:
+            generator.manual_seed(int(seed))
+        self.generator = generator
+        self.phases = 2*torch.pi*torch.rand(
+            batch_size, 3, generator=generator, device=self.device
+        )
+        self.noise = torch.zeros(batch_size, 3, device=self.device)
+        self.previous_body_velocity = None
+        self.time = 0.0
+        self._apply_boundaries(self.velocity)
+
+    def _apply_boundaries(self, velocity, moving=None, body_velocity=None):
+        velocity[:, :, :, 0] = velocity[:, :, :, -1] = 0.0
+        velocity[:, :, 0] = velocity[:, :, -1] = 0.0
+        velocity[:, 0] = 0.0
+        velocity[:, -1] = velocity[:, -2]
+        velocity[:, -1, ..., 2] = 0.0
+        velocity[:, :, :, 0] = self.inlet[:, None, None, :]
+        velocity[:, :, :, -1] = velocity[:, :, :, -2]
+        velocity[:, 0] = 0.0
+        velocity[:, -1, ..., 2] = 0.0
+        velocity.masked_fill_(self.solid[None, ..., None], 0.0)
+        if moving is not None:
+            velocity[moving] = body_velocity[:, None, None, None, :].expand_as(velocity)[moving]
+
+    def _vorticity(self, velocity):
+        curl = torch.zeros_like(velocity)
+        curl[:, 1:-1, 1:-1, 1:-1, 0] = (
+            (velocity[:, 1:-1, 2:, 1:-1, 2]-velocity[:, 1:-1, :-2, 1:-1, 2])/(2*self.dy)
+            - (velocity[:, 2:, 1:-1, 1:-1, 1]-velocity[:, :-2, 1:-1, 1:-1, 1])/(2*self.dz)
+        )
+        curl[:, 1:-1, 1:-1, 1:-1, 1] = (
+            (velocity[:, 2:, 1:-1, 1:-1, 0]-velocity[:, :-2, 1:-1, 1:-1, 0])/(2*self.dz)
+            - (velocity[:, 1:-1, 1:-1, 2:, 2]-velocity[:, 1:-1, 1:-1, :-2, 2])/(2*self.dx)
+        )
+        curl[:, 1:-1, 1:-1, 1:-1, 2] = (
+            (velocity[:, 1:-1, 1:-1, 2:, 1]-velocity[:, 1:-1, 1:-1, :-2, 1])/(2*self.dx)
+            - (velocity[:, 1:-1, 2:, 1:-1, 0]-velocity[:, 1:-1, :-2, 1:-1, 0])/(2*self.dy)
+        )
+        return curl
+
+    def _sample(self, positions):
+        normalized = positions.clone()
+        normalized[..., 0] = 2*(positions[..., 0]-self.region.x_min)/(self.region.x_max-self.region.x_min)-1
+        normalized[..., 1] = 2*(positions[..., 1]-self.region.y_min)/(self.region.y_max-self.region.y_min)-1
+        normalized[..., 2] = 2*(positions[..., 2]-self.region.bottom_z)/(self.region.surface_z-self.region.bottom_z)-1
+        grid = normalized[:, :, None, None, :]
+        sampled = torch_functional.grid_sample(
+            self.velocity.permute(0, 4, 1, 2, 3), grid,
+            mode="bilinear", padding_mode="border", align_corners=True,
+        )
+        return sampled[:, :, :, 0, 0].transpose(1, 2)
+
+    def step(self, dt, body_positions, body_velocities, radius=0.02):
+        dt = min(float(dt), 0.05)
+        positions = body_positions[:, None, None, None, :]
+        moving = (
+            (self.x[None]-positions[..., 0])**2
+            + (self.y[None]-positions[..., 1])**2
+            + (self.z[None]-positions[..., 2])**2 <= radius**2
+        ) & ~self.solid[None]
+        physical = torch.stack((self.x, self.y, self.z), dim=-1)
+        back = physical[None]-dt*self.velocity
+        flat_back = back.reshape(self.batch_size, -1, 3)
+        velocity = self._sample(flat_back).reshape_as(self.velocity)
+        advected = velocity.clone()
+        ax = self.viscosity*dt/self.dx**2
+        ay = self.viscosity*dt/self.dy**2
+        az = self.viscosity*dt/self.dz**2
+        for _ in range(4):
+            velocity[:, 1:-1, 1:-1, 1:-1] = (
+                advected[:, 1:-1, 1:-1, 1:-1]
+                + ax*(velocity[:, 1:-1, 1:-1, 2:]+velocity[:, 1:-1, 1:-1, :-2])
+                + ay*(velocity[:, 1:-1, 2:, 1:-1]+velocity[:, 1:-1, :-2, 1:-1])
+                + az*(velocity[:, 2:, 1:-1, 1:-1]+velocity[:, :-2, 1:-1, 1:-1])
+            )/(1+2*ax+2*ay+2*az)
+            self._apply_boundaries(velocity, moving, body_velocities)
+
+        self.time += dt
+        decay = np.exp(-dt/0.35)
+        self.noise = decay*self.noise + np.sqrt(1-decay**2)*torch.randn(
+            self.batch_size, 3, generator=self.generator, device=self.device
+        )
+        modulation = torch.clamp(1+0.25*self.noise, 0.4, 1.6)
+        lx = self.region.x_max-self.region.x_min
+        ly = self.region.y_max-self.region.y_min
+        lz = self.region.surface_z-self.region.bottom_z
+        eddies = torch.empty_like(velocity)
+        eddies[..., 0] = modulation[:, None, None, None, 0]*torch.sin(
+            2*torch.pi*(self.y-self.region.y_min)/ly+0.7*self.time
+            + self.phases[:, None, None, None, 0]
+        )*torch.cos(torch.pi*self.z/lz)
+        eddies[..., 1] = modulation[:, None, None, None, 1]*torch.sin(
+            2*torch.pi*self.z/lz+0.8*self.time+self.phases[:, None, None, None, 1]
+        )*torch.cos(2*torch.pi*(self.x-self.region.x_min)/lx)
+        eddies[..., 2] = modulation[:, None, None, None, 2]*torch.sin(
+            2*torch.pi*(self.x-self.region.x_min)/lx-0.9*self.time
+            + self.phases[:, None, None, None, 2]
+        )*torch.cos(2*torch.pi*(self.y-self.region.y_min)/ly)
+        velocity += dt*self.turbulence_intensity*eddies
+
+        omega = self._vorticity(velocity)
+        magnitude = torch.linalg.vector_norm(omega, dim=-1)
+        gz, gy, gx = torch.gradient(magnitude, spacing=(self.dz, self.dy, self.dx), dim=(1, 2, 3))
+        normal = torch.stack((gx, gy, gz), dim=-1)
+        normal /= torch.linalg.vector_norm(normal, dim=-1, keepdim=True)+1e-12
+        velocity += dt*self.vorticity_confinement*torch.linalg.cross(normal, omega)
+        self._apply_boundaries(velocity, moving, body_velocities)
+
+        divergence = torch.zeros_like(self.pressure)
+        divergence[:, 1:-1, 1:-1, 1:-1] = (
+            (velocity[:, 1:-1, 1:-1, 2:, 0]-velocity[:, 1:-1, 1:-1, :-2, 0])/(2*self.dx)
+            + (velocity[:, 1:-1, 2:, 1:-1, 1]-velocity[:, 1:-1, :-2, 1:-1, 1])/(2*self.dy)
+            + (velocity[:, 2:, 1:-1, 1:-1, 2]-velocity[:, :-2, 1:-1, 1:-1, 2])/(2*self.dz)
+        )
+        pressure = self.pressure.clone()
+        denominator = 2/self.dx**2+2/self.dy**2+2/self.dz**2
+        for _ in range(self.pressure_iterations):
+            pressure[:, 1:-1, 1:-1, 1:-1] = (
+                (pressure[:, 1:-1, 1:-1, 2:]+pressure[:, 1:-1, 1:-1, :-2])/self.dx**2
+                + (pressure[:, 1:-1, 2:, 1:-1]+pressure[:, 1:-1, :-2, 1:-1])/self.dy**2
+                + (pressure[:, 2:, 1:-1, 1:-1]+pressure[:, :-2, 1:-1, 1:-1])/self.dz**2
+                - self.density*divergence[:, 1:-1, 1:-1, 1:-1]/dt
+            )/denominator
+            pressure[:, :, :, 0], pressure[:, :, :, -1] = pressure[:, :, :, 1].clone(), pressure[:, :, :, -2].clone()
+            pressure[:, :, 0], pressure[:, :, -1] = pressure[:, :, 1].clone(), pressure[:, :, -2].clone()
+            pressure[:, 0], pressure[:, -1] = pressure[:, 1].clone(), pressure[:, -2].clone()
+            pressure.masked_fill_(self.solid[None], 0.0)
+        velocity[:, 1:-1, 1:-1, 1:-1, 0] -= dt/self.density*(pressure[:, 1:-1, 1:-1, 2:]-pressure[:, 1:-1, 1:-1, :-2])/(2*self.dx)
+        velocity[:, 1:-1, 1:-1, 1:-1, 1] -= dt/self.density*(pressure[:, 1:-1, 2:, 1:-1]-pressure[:, 1:-1, :-2, 1:-1])/(2*self.dy)
+        velocity[:, 1:-1, 1:-1, 1:-1, 2] -= dt/self.density*(pressure[:, 2:, 1:-1, 1:-1]-pressure[:, :-2, 1:-1, 1:-1])/(2*self.dz)
+        self.velocity, self.pressure = velocity, pressure
+        self._apply_boundaries(self.velocity, moving, body_velocities)
+
+    def forces(self, positions, velocities, masses, gravity, dt, radius=0.02):
+        positions = torch.as_tensor(positions, dtype=torch.float32, device=self.device)
+        velocities = torch.as_tensor(velocities, dtype=torch.float32, device=self.device)
+        masses = torch.as_tensor(masses, dtype=torch.float32, device=self.device)
+        self.step(dt, positions, velocities, radius)
+        offset = max(1.75*radius, 1.1*min(self.dx, self.dy, self.dz))
+        directions = torch.tensor(
+            [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
+            dtype=torch.float32, device=self.device,
+        )
+        flow = self._sample(positions[:, None, :]+offset*directions[None]).mean(dim=1)
+        relative = velocities-flow
+        drag = (
+            -0.5*self.density*0.47*np.pi*radius**2
+            * torch.linalg.vector_norm(relative, dim=1, keepdim=True)*relative
+            - 6*np.pi*0.00089*radius*relative
+        )
+        added = torch.zeros_like(drag)
+        if self.previous_body_velocity is not None and dt > 0:
+            added_mass = 0.5*self.density*4/3*np.pi*radius**3
+            added = -added_mass*(velocities-self.previous_body_velocity)/dt
+        self.previous_body_velocity = velocities.clone()
+        cap_height = torch.clamp(
+            self.region.surface_z-(positions[:, 2]-radius), 0.0, 2*radius
+        )
+        volume = np.pi*cap_height**2*(radius-cap_height/3)
+        ratio = torch.clamp(volume/(4/3*np.pi*radius**3), 0.0, 1.0)
+        force = ratio[:, None]*(drag+added)
+        force[:, 2] += masses*float(gravity)*ratio/0.5
+        return force.detach().cpu().numpy()
+
+
 @dataclass
 class FluidDynamics:
     region: FluidRegion = dataclass_field(default_factory=FluidRegion)
@@ -246,6 +456,8 @@ class FluidDynamics:
     surface_equilibrium_fraction: float = 0.5
     turn_rate: float = np.deg2rad(60.0)
     turbulence_seed: int | None = None
+    field_shape: tuple[int, int, int] = (32, 18, 10)
+    pressure_iterations: int = 16
     current_velocity: np.ndarray = dataclass_field(default_factory=lambda: np.array([-0.025, 0.0, 0.0]))
     _previous_velocity: np.ndarray | None = dataclass_field(default=None, init=False)
     field: NavierStokesField = dataclass_field(init=False)
@@ -255,15 +467,20 @@ class FluidDynamics:
         current = np.asarray(self.current_velocity, dtype=np.float64)
         self.current_velocity = np.pad(current, (0, max(0, 3-len(current))))[:3]
         self.target_current_velocity = self.current_velocity.copy()
-        self.field = NavierStokesField(
-            self.region, self.current_velocity, seed=self.turbulence_seed
+        self.field = self._new_field()
+
+    def _new_field(self):
+        nx, ny, nz = self.field_shape
+        return NavierStokesField(
+            self.region, self.current_velocity,
+            nx=nx, ny=ny, nz=nz,
+            pressure_iterations=self.pressure_iterations,
+            seed=self.turbulence_seed,
         )
 
     def reset(self):
         self._previous_velocity = None
-        self.field = NavierStokesField(
-            self.region, self.current_velocity, seed=self.turbulence_seed
-        )
+        self.field = self._new_field()
 
     def set_current_direction(self, direction):
         direction = np.asarray(direction, dtype=np.float64)

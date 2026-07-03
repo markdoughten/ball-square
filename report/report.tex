@@ -608,6 +608,15 @@ above the obstacle, around it, descend before it, or combine horizontal and
 vertical motion; underwater commands are not forced into a surface traversal
 followed by a vertical dive.
 
+Initial planning retries RRT three times for the original sampled start.  It
+does not resample the start and does not substitute an unchecked straight-line
+path.  During execution, each episode tracks its best goal distance.  If no
+meaningful improvement occurs for 250 control steps (5 simulated seconds), the
+planner constructs a new collision-free RRT route from the robot's current 3D
+position and the PID expert temporarily takes full control.  This online
+replanning and recovery mechanism addresses persistent waypoint stalls without
+changing the episode's initial-state distribution.
+
 Figure \ref{fig:fluid_rrt_paths} shows five representative plans from random
 depths.  The paths demonstrate that the planner uses the full volume: depending
 on the sampled start and tree growth, it can pass above or around the obstacle
@@ -648,9 +657,13 @@ r_t={}&25\left(d_g(s_t)-d_g(s_{t+1})\right)
 \end{aligned}
 \]
 The learning chart now reports total episode return rather than mean reward per
-step.  Training uses 360 episodes, random starts at all safe depths, 30 epochs
+step.  Training uses 1200 episodes, random starts at all safe depths, 30 epochs
 of imitation pretraining, batches of 64, six PPO epochs per batch, and a maximum
-of 2400 control steps per episode.
+of 4800 control steps per episode, corresponding to 96 seconds of simulated
+time.  PPO rollout collection uses the low-cost deterministic approximation of
+buoyancy, quadratic and viscous drag, and the mean current.  The higher-resolution
+Navier--Stokes field remains active during interactive rendering; separating the
+two keeps large batched training runs computationally practical.
 
 \begin{figure}[H]
     \centering
@@ -660,10 +673,10 @@ of 2400 control steps per episode.
     \label{fig:fluid_learning}
 \end{figure}
 
-The return is normally between approximately 30 and 45.  Four isolated large
-negative returns correspond to rare timeout or failed episodes; the moving
-average recovers immediately.  The absence of a strong upward trend is expected
-because imitation pretraining and expert shielding already provide high success
+All 1200 training episodes reached the underwater goal without collision or
+timeout.  Episode returns remain positive, with most values between approximately
+25 and 48; the former large negative timeout spikes are absent.  The moving
+average remains broadly stable because imitation pretraining and expert shielding already provide high success
 at the beginning of PPO training.  Further reward shaping is not presently
 justified; a stronger test of policy learning would instead reduce expert
 authority gradually.
@@ -677,9 +690,9 @@ authority gradually.
 
 \section{Current Results}
 
-The best checkpoint was selected after 192 episodes.  Its stored evaluation over
+The best checkpoint was selected after 704 episodes.  Its stored evaluation over
 32 randomized-depth episodes reported 100\% success, 0\% collisions, and mean
-per-step reward \(0.0842\).  Table
+per-step reward \(0.1091\).  No evaluation episode timed out.  Table
 \ref{tab:fluid_checkpoint} summarizes the current result.
 
 \begin{table}[H]
@@ -688,12 +701,13 @@ per-step reward \(0.0842\).  Table
         \hline
         \textbf{Metric} & \textbf{Current 3D fluid checkpoint} \\
         \hline
-        Training episodes & 360 \\
-        Selected checkpoint episode & 192 \\
+        Training episodes & 1200 \\
+        Selected checkpoint episode & 704 \\
         Stored evaluation success & 100\% \\
         Collision rate & 0\% \\
-        Stored mean reward per step & 0.0842 \\
-        Goal radius & 0.01 m \\
+        Timeout rate & 0\% \\
+        Stored mean reward per step & 0.1091 \\
+        Training goal radius & 0.015 m \\
         \hline
     \end{tabular}
     \caption{Performance of the depth-randomized underwater controller.}

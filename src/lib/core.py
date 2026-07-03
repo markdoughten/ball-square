@@ -59,17 +59,21 @@ def apply_training_fluid_forces(model, data, body_id, radius=0.02):
     data.xfrc_applied[body_id, :3] += submerged_ratio*drag
 
 
-def step_training_simulation(model, data, body_id, action):
-    """Apply one control action with stable 0.01 s physics substeps."""
+def step_training_simulation(model, data, body_id, action, fluid=None):
+    """Apply one control action with stable hydrodynamic physics substeps."""
     control_timestep = float(model.opt.timestep)
     substeps = max(1, int(round(control_timestep/0.01)))
     model.opt.timestep = control_timestep/substeps
     data.ctrl[:3] = action
     for _ in range(substeps):
         data.xfrc_applied[body_id] = 0.0
-        apply_training_fluid_forces(model, data, body_id)
+        if fluid is None:
+            apply_training_fluid_forces(model, data, body_id)
+        else:
+            fluid.apply(model, data, body_id, radius=0.02)
         mujoco.mj_step(model, data)
     model.opt.timestep = control_timestep
+
 
 class ActorNetwork(nn.Module):
     
@@ -1173,7 +1177,7 @@ def deterministic_evaluation(
     outside_walls,
     mujoco_model,
     episodes=32,
-    max_steps=1800,
+    max_steps=4800,
     epsilon=0.1,
     collision_penalty=5.0,
     expert_only=False,
@@ -1206,6 +1210,8 @@ def deterministic_evaluation(
     collisions = np.zeros(episodes, dtype=bool)
     total_rewards = np.zeros(episodes)
     step_counts = np.zeros(episodes, dtype=np.int32)
+    best_distances = np.linalg.norm(states[:, :3]-goal_position, axis=1)
+    no_progress_steps = np.zeros(episodes, dtype=np.int32)
 
     model.eval()
     with torch.no_grad():
@@ -1213,6 +1219,16 @@ def deterministic_evaluation(
             indices = np.flatnonzero(active)
             if indices.size == 0:
                 break
+            replanned = np.zeros(episodes, dtype=bool)
+            for env_index in indices[no_progress_steps[indices] >= 250]:
+                new_path = plan_navigation_path(
+                    states[env_index, :3], goal_position, walls, outside_walls
+                )
+                if new_path is not None:
+                    paths[env_index] = new_path
+                    waypoint_indices[env_index] = 1
+                    no_progress_steps[env_index] = 0
+                    replanned[env_index] = True
             targets = current_path_targets(states, paths, waypoint_indices)
             state_tensor = torch.as_tensor(
                 observations_for_targets(states[indices], targets[indices]),
@@ -1231,6 +1247,16 @@ def deterministic_evaluation(
                 actions = safety_shield_actions(
                     states[indices], targets[indices],
                     torch.tanh(mu).cpu().numpy(), walls, outside_walls,
+                )
+            recovering = (
+                (no_progress_steps[indices] >= 250) | replanned[indices]
+            )
+            if recovering.any():
+                actions[recovering] = safety_shield_actions(
+                    states[indices][recovering], targets[indices][recovering],
+                    pid_expert_actions(
+                        states[indices][recovering], targets[indices][recovering]
+                    ), walls, outside_walls,
                 )
             next_states = np.empty_like(states[indices])
             step_collisions = np.zeros(indices.size, dtype=bool)
@@ -1269,6 +1295,13 @@ def deterministic_evaluation(
                 & (np.linalg.norm(next_states[:, 3:6], axis=1) < 0.01)
             )
             reached_goal = new_distances <= epsilon
+            improved = new_distances < best_distances[indices]-1e-4
+            best_distances[indices] = np.minimum(
+                best_distances[indices], new_distances
+            )
+            no_progress_steps[indices] = np.where(
+                improved, 0, no_progress_steps[indices]+1
+            )
             rewards += reached_goal * 25.0
             rewards -= step_collisions * collision_penalty
 
@@ -1280,9 +1313,14 @@ def deterministic_evaluation(
             finished = reached_goal | step_collisions
             active[indices[finished]] = False
     model.train()
+    final_distances = np.linalg.norm(states[:, :3]-goal_position, axis=1)
     return {
         "success_rate": float(successes.mean()),
         "collision_rate": float(collisions.mean()),
+        "timeout_rate": float(active.mean()),
+        "timeout_mean_distance": (
+            float(final_distances[active].mean()) if active.any() else 0.0
+        ),
         "mean_reward": float((total_rewards / np.maximum(step_counts, 1)).mean()),
     }
 
@@ -1293,7 +1331,7 @@ def ppo_training(
     outside_walls,
     num_episodes=360,
     batch_size=64,
-    max_steps=1800,
+    max_steps=4800,
     gamma=0.99,
     gae_lambda=0.95,
     clip_ratio=0.2,
@@ -1358,6 +1396,8 @@ def ppo_training(
         collisions = np.zeros(current_size, dtype=bool)
         total_rewards = np.zeros(current_size)
         step_counts = np.zeros(current_size, dtype=np.int32)
+        best_distances = np.linalg.norm(states[:, :3]-goal_position, axis=1)
+        no_progress_steps = np.zeros(current_size, dtype=np.int32)
         observations_buffer = []
         raw_actions_buffer = []
         old_log_probs_buffer = []
@@ -1371,6 +1411,18 @@ def ppo_training(
             valid = active.copy()
             if not valid.any():
                 break
+            replanned = np.zeros(current_size, dtype=bool)
+            for env_index in np.flatnonzero(
+                valid & (no_progress_steps >= 250)
+            ):
+                new_path = plan_navigation_path(
+                    states[env_index, :3], goal_position, walls, outside_walls
+                )
+                if new_path is not None:
+                    paths[env_index] = new_path
+                    waypoint_indices[env_index] = 1
+                    no_progress_steps[env_index] = 0
+                    replanned[env_index] = True
             targets = current_path_targets(states, paths, waypoint_indices)
             segment_starts = current_path_starts(paths, waypoint_indices)
             observations = observations_for_targets(states, targets)
@@ -1387,6 +1439,15 @@ def ppo_training(
             actions_cpu = safety_shield_actions(
                 states, targets, actions.cpu().numpy(), walls, outside_walls
             )
+            recovering = valid & (
+                (no_progress_steps >= 250) | replanned
+            )
+            if recovering.any():
+                actions_cpu[recovering] = safety_shield_actions(
+                    states[recovering], targets[recovering],
+                    pid_expert_actions(states[recovering], targets[recovering]),
+                    walls, outside_walls,
+                )
             raw_actions = torch.as_tensor(
                 np.arctanh(np.clip(actions_cpu, -0.999999, 0.999999)),
                 dtype=torch.float32, device=device,
@@ -1431,6 +1492,13 @@ def ppo_training(
                 next_states[:, :3], segment_starts, targets
             )
             reached_goal = (new_distances <= epsilon) & valid
+            improved = new_distances < best_distances-1e-4
+            best_distances[valid] = np.minimum(
+                best_distances[valid], new_distances[valid]
+            )
+            no_progress_steps[valid] = np.where(
+                improved[valid], 0, no_progress_steps[valid]+1
+            )
             rewards += reached_goal * 25.0
             rewards -= step_collisions * collision_penalty
             timed_out = valid & (step == max_steps - 1)
@@ -1664,7 +1732,7 @@ def plot_learning_curve(episode_rewards, output_path=None):
     window_size = 10  # Adjust for smoothing
     moving_avg_rewards = np.convolve(episode_rewards, np.ones(window_size) / window_size, mode='valid')
     figure, axis = plt.subplots(figsize=(10, 6))
-    axis.plot(episode_rewards, label="Avg. Reward per Episode", alpha=0.5)
+    axis.plot(episode_rewards, label="Episode return", alpha=0.5)
     axis.plot(range(window_size - 1, len(episode_rewards)), moving_avg_rewards,
              label=f"Moving Average (window={window_size})", color='orange')
     axis.set_xlabel("Episode")
@@ -1967,7 +2035,7 @@ def main():
                 num_episodes=num_training_episodes,
                 batch_size=64,
                 mujoco_model=mujoco_model,
-                max_steps=1800,
+                max_steps=4800,
                 gamma=0.99,
                 plot_directory=os.path.join(
                     project_root, "report", "images", "fluid"

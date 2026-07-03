@@ -14,6 +14,8 @@
       <site name="sensor_ball" />
       <joint name="joint_x" type="slide" pos="0 0 0" axis="1 0 0" />
       <joint name="joint_y" type="slide" pos="0 0 0" axis="0 1 0" />
+      <joint name="joint_z" type="slide" pos="0 0 0" axis="0 0 1"
+        limited="true" range="0 0.15" damping="60" />
     </body>
 
 
@@ -28,14 +30,22 @@
       <geom name="gcase_d" type="box" size="0.7 0.04 0.1" pos="0.45 -.36 0" />
     </body>
     
-    <site name="target4" type="box" pos="0.9 0.0 0.0" size="0.2 0.3" rgba="0 1 0.6 0.2" />
+    <!-- Translucent tank volume; forces are supplied by lib/fluid.py. -->
+    <body name="water" pos="0.45 0 0.075">
+      <!-- Filled from the floor to z=0.15: above wall_3, below the case walls. -->
+      <geom name="water_surface" type="box" size="0.67 0.32 0.075"
+        rgba="0.2 0.5 0.8 0.3" contype="0" conaffinity="0" />
+    </body>
+    <site name="underwater_target" type="sphere" pos="0.9 -0.22 0.06"
+      size="0.035" rgba="0.1 1 1 0.8" />
 
 
   </worldbody>
 
   <actuator>
-    <motor name="actuator_x" joint="joint_x" gear="1" />
-    <motor name="actuator_y" joint="joint_y" gear="1" />
+    <motor name="actuator_x" joint="joint_x" gear="15" ctrllimited="true" ctrlrange="-1 1" />
+    <motor name="actuator_y" joint="joint_y" gear="15" ctrllimited="true" ctrlrange="-1 1" />
+    <motor name="actuator_z" joint="joint_z" gear="80" ctrllimited="true" ctrlrange="-1 1" />
   </actuator>
 
   <asset>

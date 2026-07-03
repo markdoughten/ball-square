@@ -11,6 +11,58 @@ import glfw
 import os
 
 PATH_CLEARANCE = 0.06
+POSITION_DIMENSIONS = 3
+MOTOR_FORCE_SCALE = np.array([15.0, 15.0, 80.0])
+CONTROL_TIMESTEP = 0.02
+
+
+def simulation_state(model, data, body_id):
+    """Return world position and XYZ joint velocity."""
+    return np.hstack((data.xpos[body_id, :3], data.qvel[:3])).copy()
+
+
+def set_simulation_state(model, data, state, body_id):
+    """Set a world-space `[x,y,z,vx,vy,vz]` state in MuJoCo."""
+    state = np.asarray(state)
+    data.qpos[:2] = state[:2]
+    data.qpos[2] = state[2] - model.body_pos[body_id, 2]
+    data.qvel[:3] = state[3:6]
+    mujoco.mj_forward(model, data)
+
+
+def apply_training_fluid_forces(model, data, body_id, radius=0.02):
+    """Low-cost hydrodynamics used by parallel PPO environments."""
+    center_z = float(data.xpos[body_id, 2])
+    surface_z = 0.15
+    cap_height = np.clip(surface_z-(center_z-radius), 0.0, 2.0*radius)
+    submerged_volume = np.pi*cap_height**2*(radius-cap_height/3.0)
+    sphere_volume = 4.0/3.0*np.pi*radius**3
+    submerged_ratio = submerged_volume/sphere_volume
+    gravity = abs(float(model.opt.gravity[2]))
+    # Same half-submerged equilibrium used by FluidDynamics.
+    data.xfrc_applied[body_id, 2] += (
+        model.body_mass[body_id]*gravity*submerged_ratio/0.5
+    )
+    relative_velocity = data.qvel[:3]-np.array([-0.025, 0.0, 0.0])
+    drag = (
+        -0.5*997.0*0.47*np.pi*radius**2
+        * np.linalg.norm(relative_velocity)*relative_velocity
+        - 6.0*np.pi*0.00089*radius*relative_velocity
+    )
+    data.xfrc_applied[body_id, :3] += submerged_ratio*drag
+
+
+def step_training_simulation(model, data, body_id, action):
+    """Apply one control action with stable 0.01 s physics substeps."""
+    control_timestep = float(model.opt.timestep)
+    substeps = max(1, int(round(control_timestep/0.01)))
+    model.opt.timestep = control_timestep/substeps
+    data.ctrl[:3] = action
+    for _ in range(substeps):
+        data.xfrc_applied[body_id] = 0.0
+        apply_training_fluid_forces(model, data, body_id)
+        mujoco.mj_step(model, data)
+    model.opt.timestep = control_timestep
 
 class ActorNetwork(nn.Module):
     
@@ -93,6 +145,66 @@ def init_mujoco_render(model):
     camera.distance = 2.0
     camera.lookat = np.array([0.5, 0.0, 0.0])
 
+    mouse = {
+        "left": False,
+        "middle": False,
+        "right": False,
+        "last_x": 0.0,
+        "last_y": 0.0,
+    }
+
+    def mouse_button_callback(window, button, action, mods):
+        pressed = action == glfw.PRESS
+        if button == glfw.MOUSE_BUTTON_LEFT:
+            mouse["left"] = pressed
+        elif button == glfw.MOUSE_BUTTON_MIDDLE:
+            mouse["middle"] = pressed
+        elif button == glfw.MOUSE_BUTTON_RIGHT:
+            mouse["right"] = pressed
+        mouse["last_x"], mouse["last_y"] = glfw.get_cursor_pos(window)
+
+    def cursor_position_callback(window, x_position, y_position):
+        if not (mouse["left"] or mouse["middle"] or mouse["right"]):
+            return
+        width, height = glfw.get_window_size(window)
+        delta_x = x_position - mouse["last_x"]
+        delta_y = y_position - mouse["last_y"]
+        mouse["last_x"], mouse["last_y"] = x_position, y_position
+        shift = (
+            glfw.get_key(window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS
+            or glfw.get_key(window, glfw.KEY_RIGHT_SHIFT) == glfw.PRESS
+        )
+        if mouse["right"]:
+            camera_action = mujoco.mjtMouse.mjMOUSE_MOVE_H
+        elif mouse["middle"]:
+            camera_action = mujoco.mjtMouse.mjMOUSE_MOVE_V
+        elif shift:
+            camera_action = mujoco.mjtMouse.mjMOUSE_ROTATE_H
+        else:
+            camera_action = mujoco.mjtMouse.mjMOUSE_ROTATE_V
+        mujoco.mjv_moveCamera(
+            model,
+            camera_action,
+            delta_x / max(width, 1),
+            delta_y / max(height, 1),
+            scene,
+            camera,
+        )
+
+    def scroll_callback(window, x_offset, y_offset):
+        mujoco.mjv_moveCamera(
+            model,
+            mujoco.mjtMouse.mjMOUSE_ZOOM,
+            0.0,
+            -0.05 * y_offset,
+            scene,
+            camera,
+        )
+
+    glfw.set_mouse_button_callback(window, mouse_button_callback)
+    glfw.set_cursor_pos_callback(window, cursor_position_callback)
+    glfw.set_scroll_callback(window, scroll_callback)
+
     return window, camera, scene, context, viewport, option
 
 def render_mujoco_scene(model, data, scene, context, viewport, camera, window, option):
@@ -113,40 +225,126 @@ def render_trained_policy(
     max_steps=1800,
     spawn_margin=0.025,
     fixed_start=False,
+    initial_state=None,
+    interactive=False,
+    destination_positions=None,
     device=torch.device("cpu"),
 ):
     """Render the deterministic policy without changing model weights."""
-    if fixed_start:
-        state = np.array([0.0, 0.0, 0.0, 0.0])
+    control_timestep = float(mujoco_model.opt.timestep)
+    physics_substeps = max(1, int(round(control_timestep / 0.01)))
+    mujoco_model.opt.timestep = control_timestep / physics_substeps
+    if initial_state is not None:
+        state = np.asarray(initial_state, dtype=np.float64).copy()
+    elif fixed_start:
+        state = np.array([0.0, 0.0, outside_walls["z_max"], 0.0, 0.0, 0.0])
     else:
         state = random_position(
             walls, outside_walls, goal_position,
             minimum_goal_distance=epsilon * 2,
             safety_margin=max(spawn_margin, PATH_CLEARANCE),
         )
-    mujoco_data.qpos[:2] = state[:2]
-    mujoco_data.qvel[:2] = state[2:]
-    mujoco.mj_forward(mujoco_model, mujoco_data)
     ball_body_id = mujoco.mj_name2id(
         mujoco_model, mujoco.mjtObj.mjOBJ_BODY, "ball"
     )
-    paths = create_episode_paths(
-        state[None, :], goal_position, walls, outside_walls
+    set_simulation_state(mujoco_model, mujoco_data, state, ball_body_id)
+    navigation_goal = np.asarray(goal_position, dtype=np.float64)
+    if len(navigation_goal) == 2:
+        navigation_goal = np.append(navigation_goal, outside_walls["z_max"])
+    start_position = mujoco_data.xpos[ball_body_id, :3].copy()
+    path = plan_navigation_path(
+        start_position, navigation_goal, walls, outside_walls
     )
+    paths = [path if path is not None else [start_position, navigation_goal]]
     waypoint_indices = np.ones(1, dtype=np.int32)
     print(f"Following RRT path with {len(paths[0])} waypoints.")
     window, camera, scene, context, viewport, option = init_mujoco_render(
         mujoco_model
     )
     reached_goal = False
+    active_goal = navigation_goal.copy()
+    destination_positions = destination_positions or {
+        "start": np.array([0.0, 0.0, outside_walls["z_max"]]),
+        "goal": np.array([0.8, 0.0, outside_walls["z_max"]]),
+        "underwater": np.array([0.9, -0.22, 0.06]),
+    }
+    from .fluid import FluidDynamics
+    fluid = FluidDynamics()
+    current_directions = {
+        glfw.KEY_LEFT: np.array([-1.0, 0.0]),
+        glfw.KEY_RIGHT: np.array([1.0, 0.0]),
+        glfw.KEY_UP: np.array([0.0, 1.0]),
+        glfw.KEY_DOWN: np.array([0.0, -1.0]),
+    }
+
+    def fluid_key_callback(window, key, scancode, action, mods):
+        if action not in {glfw.PRESS, glfw.REPEAT} or key not in current_directions:
+            return
+        fluid.set_current_direction(current_directions[key])
+        direction_name = {
+            glfw.KEY_LEFT: "left", glfw.KEY_RIGHT: "right",
+            glfw.KEY_UP: "up", glfw.KEY_DOWN: "down",
+        }[key]
+        print(f"\nFluid current turning toward {direction_name}.")
+        if interactive:
+            print("Command: ", end="", flush=True)
+
+    glfw.set_key_callback(window, fluid_key_callback)
+    ball_geom_id = mujoco.mj_name2id(
+        mujoco_model, mujoco.mjtObj.mjOBJ_GEOM, "gball_0"
+    )
+    ball_radius = float(mujoco_model.geom_size[ball_geom_id, 0])
+    if interactive:
+        from .commands import parse_destination, poll_console_line
+        print("Simulation controls: 'start', 'goal', 'underwater', or 'quit'.")
+        print("Use the arrow keys in the simulation window to steer the current.")
+        print("Command: ", end="", flush=True)
     model.eval()
     with torch.no_grad():
-        for step in range(max_steps):
+        step = 0
+        while interactive or step < max_steps:
             if glfw.window_should_close(window):
                 break
-            targets = current_path_targets(
-                state[None, :], paths, waypoint_indices
+            step += 1
+            if interactive:
+                command = poll_console_line()
+                if command is not None:
+                    normalized_command = command.lower()
+                    if normalized_command in {"quit", "exit"}:
+                        break
+                    destination = parse_destination(command)
+                    if destination is None:
+                        print("Unknown command; use 'start', 'goal', 'underwater', or 'quit'.")
+                    else:
+                        active_goal = np.asarray(
+                            destination_positions[destination], dtype=np.float64
+                        )
+                        if len(active_goal) == 2:
+                            active_goal = np.append(
+                                active_goal, outside_walls["z_max"]
+                            )
+                        physical_position = mujoco_data.xpos[ball_body_id, :3].copy()
+                        new_path = plan_navigation_path(
+                            physical_position, active_goal, walls, outside_walls
+                        )
+                        paths = [
+                            new_path if new_path is not None
+                            else [physical_position, active_goal]
+                        ]
+                        waypoint_indices[:] = 1
+                        reached_goal = False
+                        print(
+                            f"Redirecting to {destination} at "
+                            f"{tuple(active_goal)} ({len(paths[0])} waypoints)."
+                        )
+                    print("Command: ", end="", flush=True)
+            physical_state = simulation_state(
+                mujoco_model, mujoco_data, ball_body_id
             )
+            targets_3d = current_path_targets(
+                physical_state[None, :], paths, waypoint_indices
+            )
+            targets = targets_3d
             state_tensor = torch.as_tensor(
                 observations_for_targets(state, targets)[0],
                 dtype=torch.float32, device=device
@@ -156,22 +354,40 @@ def render_trained_policy(
                 state, targets, torch.tanh(mu).cpu().numpy(),
                 walls, outside_walls,
             )[0]
-            mujoco_data.xfrc_applied[ball_body_id, :2] = action
-            mujoco.mj_step(mujoco_model, mujoco_data)
-            state = np.hstack((mujoco_data.qpos[:2], mujoco_data.qvel[:2]))
+            for _ in range(physics_substeps):
+                # Applied forces persist in MuJoCo until explicitly reset.
+                mujoco_data.xfrc_applied[ball_body_id] = 0.0
+                mujoco_data.ctrl[:3] = action
+                fluid.apply(mujoco_model, mujoco_data, ball_body_id, ball_radius)
+                mujoco.mj_step(mujoco_model, mujoco_data)
+            state = simulation_state(mujoco_model, mujoco_data, ball_body_id)
             render_mujoco_scene(
                 mujoco_model, mujoco_data, scene, context, viewport,
                 camera, window, option,
             )
-            if np.linalg.norm(state[:2] - goal_position) <= epsilon:
+            goal_tolerance = (
+                min(epsilon, 0.03)
+                if active_goal[2] < outside_walls["z_max"]-0.005
+                else epsilon
+            )
+            if (
+                not reached_goal
+                and np.linalg.norm(
+                    mujoco_data.xpos[ball_body_id, :3] - active_goal
+                ) <= goal_tolerance
+            ):
                 reached_goal = True
-                print(f"Goal reached in {step + 1} steps.")
-                break
+                print(f"Goal reached in {step} steps.")
+                if interactive:
+                    print("Command: ", end="", flush=True)
+                else:
+                    break
     model.train()
+    mujoco_model.opt.timestep = control_timestep
     glfw.terminate()
     if not reached_goal:
         print("Goal was not reached during this evaluation episode.")
-    return reached_goal
+    return reached_goal, state
 
 def sample_action(mu, sigma):
     dist = torch.distributions.Normal(mu, sigma)
@@ -199,15 +415,19 @@ def environment_geometry(model, data, clearance=0.005):
     right_min, right_max = geom_bounds("gcase_b")
     top_min, top_max = geom_bounds("gcase_c")
     bottom_min, bottom_max = geom_bounds("gcase_d")
+    water_min, water_max = geom_bounds("water_surface")
 
     walls = {
         "x_min": float(wall_min[0]), "x_max": float(wall_max[0]),
-        "y_min": float(wall_min[1]), "y_max": float(wall_max[1])
+        "y_min": float(wall_min[1]), "y_max": float(wall_max[1]),
+        "z_min": float(wall_min[2]), "z_max": float(wall_max[2]),
     }
     outside_walls = {
         "x_min": float(left_max[0]), "x_max": float(right_min[0]),
         "y_min": float(bottom_max[1]), "y_max": float(top_min[1])
     }
+    outside_walls["z_min"] = max(float(water_min[2]), ball_radius)
+    outside_walls["z_max"] = float(water_max[2])
     return walls, outside_walls, spawn_margin
 
 def wall_collision(model, data):
@@ -253,17 +473,17 @@ def navigation_targets(positions, goal_position, walls, clearance=0.05):
 def policy_observations(states, goal_position, walls):
     """Add the vector to the next navigation waypoint to each physical state."""
     states = np.atleast_2d(states)
-    targets = navigation_targets(states[:, :2], goal_position, walls)
-    observations = np.concatenate((states, targets - states[:, :2]), axis=1)
+    targets = navigation_targets(states[:, :3], goal_position, walls)
+    observations = np.concatenate((states, targets - states[:, :3]), axis=1)
     return observations
 
 def navigation_progress(previous_states, next_states, goal_position, walls):
     """Progress toward the waypoint selected before taking the action."""
     previous_states = np.atleast_2d(previous_states)
     next_states = np.atleast_2d(next_states)
-    targets = navigation_targets(previous_states[:, :2], goal_position, walls)
-    previous_distance = np.linalg.norm(targets - previous_states[:, :2], axis=1)
-    next_distance = np.linalg.norm(targets - next_states[:, :2], axis=1)
+    targets = navigation_targets(previous_states[:, :3], goal_position, walls)
+    previous_distance = np.linalg.norm(targets - previous_states[:, :3], axis=1)
+    next_distance = np.linalg.norm(targets - next_states[:, :3], axis=1)
     return previous_distance - next_distance
 
 class PathNode:
@@ -272,7 +492,8 @@ class PathNode:
         self.parent = parent
 
 def path_point_is_free(point, walls, outside_walls, clearance=PATH_CLEARANCE):
-    x, y = point
+    point = np.asarray(point)
+    x, y = point[:2]
     if not (
         outside_walls["x_min"] + clearance <= x
         <= outside_walls["x_max"] - clearance
@@ -280,10 +501,22 @@ def path_point_is_free(point, walls, outside_walls, clearance=PATH_CLEARANCE):
         <= outside_walls["y_max"] - clearance
     ):
         return False
-    return not (
+    overlaps_obstacle_xy = (
         walls["x_min"] - clearance <= x <= walls["x_max"] + clearance
         and walls["y_min"] - clearance <= y <= walls["y_max"] + clearance
     )
+    if len(point) == 2:
+        return not overlaps_obstacle_xy
+    z = point[2]
+    if not (
+        outside_walls["z_min"] - 0.005
+        <= z <= outside_walls["z_max"] + 0.025
+    ):
+        return False
+    # Vertical clearance represents the ball radius plus a small safety gap;
+    # the larger planar RRT clearance would incorrectly forbid surface paths.
+    overlaps_obstacle_z = z <= walls["z_max"] + 0.025
+    return not (overlaps_obstacle_xy and overlaps_obstacle_z)
 
 def path_segment_is_free(
     start, end, walls, outside_walls, clearance=PATH_CLEARANCE, samples=40
@@ -348,6 +581,7 @@ def plan_rrt_path(
         return densify_path([start, goal])
 
     nodes = [PathNode(start)]
+    dimensions = len(start)
     x_min = outside_walls["x_min"] + clearance
     x_max = outside_walls["x_max"] - clearance
     y_min = outside_walls["y_min"] + clearance
@@ -356,10 +590,15 @@ def plan_rrt_path(
         if random.random() < goal_bias:
             sample = goal
         else:
-            sample = np.array([
+            coordinates = [
                 random.uniform(x_min, x_max),
                 random.uniform(y_min, y_max),
-            ])
+            ]
+            if dimensions == 3:
+                coordinates.append(random.uniform(
+                    outside_walls["z_min"], outside_walls["z_max"]
+                ))
+            sample = np.array(coordinates)
         nearest = min(nodes, key=lambda node: np.linalg.norm(node.position - sample))
         direction = sample - nearest.position
         distance = np.linalg.norm(direction)
@@ -383,22 +622,41 @@ def plan_rrt_path(
             )
     return None
 
+
+def plan_navigation_path(start, goal, walls, outside_walls):
+    """Plan at the surface first, then dive vertically for submerged goals."""
+    start = np.asarray(start, dtype=np.float64)
+    goal = np.asarray(goal, dtype=np.float64)
+    surface = outside_walls["z_max"]
+    if len(goal) == 3 and goal[2] < surface-0.005:
+        surface_goal = goal.copy()
+        surface_goal[2] = surface
+        surface_path = plan_rrt_path(
+            start, surface_goal, walls, outside_walls
+        )
+        if surface_path is None:
+            return None
+        dive = densify_path([surface_goal, goal], maximum_interval=0.02)
+        return surface_path+dive[1:]
+    return plan_rrt_path(start, goal, walls, outside_walls)
+
 def create_episode_paths(states, goal_position, walls, outside_walls):
     paths = []
     for state in states:
         path = plan_rrt_path(
-            state[:2], goal_position, walls, outside_walls
+            state[:3], goal_position, walls, outside_walls
         )
-        paths.append(path if path is not None else [state[:2], goal_position])
+        paths.append(path if path is not None else [state[:3], goal_position])
     return paths
 
 def current_path_targets(states, paths, waypoint_indices, tolerance=0.02):
-    targets = np.empty((len(states), 2), dtype=np.float64)
+    dimensions = len(paths[0][0])
+    targets = np.empty((len(states), dimensions), dtype=np.float64)
     for index, (state, path) in enumerate(zip(states, paths)):
         while (
             waypoint_indices[index] < len(path) - 1
             and np.linalg.norm(
-                state[:2] - path[waypoint_indices[index]]
+                state[:dimensions] - path[waypoint_indices[index]]
             ) <= tolerance
         ):
             waypoint_indices[index] += 1
@@ -408,14 +666,24 @@ def current_path_targets(states, paths, waypoint_indices, tolerance=0.02):
 def observations_for_targets(states, targets):
     states = np.atleast_2d(states)
     targets = np.atleast_2d(targets)
-    return np.concatenate((states, targets - states[:, :2]), axis=1)
+    return np.concatenate((states, targets - states[:, :3]), axis=1)
 
 def pid_expert_actions(states, targets, kp=6.0, kd=6.0):
     """Bounded PD controls used as collision-free path-following demonstrations."""
     states = np.atleast_2d(states)
     targets = np.atleast_2d(targets)
-    controls = kp * (targets - states[:, :2]) - kd * states[:, 2:4]
-    return np.tanh(controls)
+    controls = np.empty((len(states), 3), dtype=np.float64)
+    controls[:, :2] = np.tanh(
+        kp*(targets[:, :2]-states[:, :2])-kd*states[:, 3:5]
+    )
+    dive_feedforward = np.where(targets[:, 2] < 0.145, -55.0, 0.0)
+    vertical_force = (
+        80.0*(targets[:, 2]-states[:, 2])
+        - 50.0*states[:, 5]
+        + dive_feedforward
+    )
+    controls[:, 2] = np.clip(vertical_force/MOTOR_FORCE_SCALE[2], -1.0, 1.0)
+    return controls
 
 def segment_cross_track_distances(points, starts, ends):
     points = np.atleast_2d(points)
@@ -431,25 +699,34 @@ def segment_cross_track_distances(points, starts, ends):
     return np.linalg.norm(points - projections, axis=1)
 
 def current_path_starts(paths, waypoint_indices):
-    starts = np.empty((len(paths), 2), dtype=np.float64)
+    starts = np.empty((len(paths), 3), dtype=np.float64)
     for index, path in enumerate(paths):
         starts[index] = path[max(0, waypoint_indices[index] - 1)]
     return starts
 
-def safety_shield_actions(states, targets, actions, walls, outside_walls):
+def safety_shield_actions(
+    states, targets, actions, walls, outside_walls, z_positions=None
+):
     """Blend toward PID control and reject predicted geometry violations."""
     states = np.atleast_2d(states)
     actions = np.atleast_2d(actions).copy()
     expert = pid_expert_actions(states, targets)
-    actions = 0.25 * actions + 0.75 * expert
+    brake = np.empty_like(actions)
+    brake[:, :2] = np.tanh(-8.0*states[:, 3:5])
+    brake[:, 2] = np.clip(
+        -50.0*states[:, 5]/MOTOR_FORCE_SCALE[2], -1.0, 1.0
+    )
+    actions = 0.10 * actions + 0.90 * expert
     predicted_positions = (
-        states[:, :2] + states[:, 2:4] * 0.1 + actions * (0.1 ** 2 / 5.0)
+        states[:, :3] + states[:, 3:6] * CONTROL_TIMESTEP
+        + actions * MOTOR_FORCE_SCALE * (CONTROL_TIMESTEP ** 2 / 5.0)
     )
     for index, predicted in enumerate(predicted_positions):
+        collision_point = predicted
         if not path_point_is_free(
-            predicted, walls, outside_walls, clearance=0.025
+            collision_point, walls, outside_walls, clearance=0.025
         ):
-            actions[index] = expert[index]
+            actions[index] = brake[index]
     return np.clip(actions, -1.0, 1.0)
 
 def pretrain_actor_from_rrt(
@@ -470,13 +747,13 @@ def pretrain_actor_from_rrt(
             minimum_goal_distance=0.2,
             safety_margin=PATH_CLEARANCE,
         )
-        path = plan_rrt_path(start[:2], goal_position, walls, outside_walls)
+        path = plan_rrt_path(start[:3], goal_position, walls, outside_walls)
         if path is None:
             continue
         for path_start, path_end in zip(path, path[1:]):
             for amount in np.linspace(0.0, 0.9, 5):
                 position = (1.0 - amount) * path_start + amount * path_end
-                velocity = np.random.uniform(-0.15, 0.15, size=2)
+                velocity = np.random.uniform(-0.15, 0.15, size=3)
                 states.append(np.hstack((position, velocity)))
                 targets.append(path_end)
                 if len(states) >= sample_count:
@@ -513,14 +790,11 @@ def pretrain_actor_from_rrt(
     return imitation_error
 
 def transition(state, action, dt=0.01):
-    x, y, vx, vy = state
-    fx, fy = action
-    noise_x, noise_y = np.random.normal(0, 0.1, 2)
-    new_vx = vx + (fx - noise_x) * dt
-    new_vy = vy + (fy - noise_y) * dt
-    new_x = x + new_vx * dt
-    new_y = y + new_vy * dt
-    return np.array([new_x, new_y, new_vx, new_vy])
+    state = np.asarray(state)
+    action = np.asarray(action)
+    velocity = state[3:6] + (action - np.random.normal(0, 0.1, 3)) * dt
+    position = state[:3] + velocity * dt
+    return np.hstack((position, velocity))
 
 def actor_critic_training(
     model,
@@ -891,16 +1165,14 @@ def deterministic_evaluation(
         )
         for _ in range(episodes)
     ])
-    data_batch = [mujoco.MjData(mujoco_model) for _ in range(episodes)]
-    for state, data in zip(states, data_batch):
-        data.qpos[:2] = state[:2]
-        data.qvel[:2] = state[2:]
-        mujoco.mj_forward(mujoco_model, data)
-    paths = create_episode_paths(states, goal_position, walls, outside_walls)
-    waypoint_indices = np.ones(episodes, dtype=np.int32)
     ball_body_id = mujoco.mj_name2id(
         mujoco_model, mujoco.mjtObj.mjOBJ_BODY, "ball"
     )
+    data_batch = [mujoco.MjData(mujoco_model) for _ in range(episodes)]
+    for state, data in zip(states, data_batch):
+        set_simulation_state(mujoco_model, data, state, ball_body_id)
+    paths = create_episode_paths(states, goal_position, walls, outside_walls)
+    waypoint_indices = np.ones(episodes, dtype=np.int32)
     active = np.ones(episodes, dtype=bool)
     successes = np.zeros(episodes, dtype=bool)
     collisions = np.zeros(episodes, dtype=bool)
@@ -920,8 +1192,12 @@ def deterministic_evaluation(
             )
             mu, _, _ = model(state_tensor)
             if expert_only:
-                actions = pid_expert_actions(
+                expert_actions = pid_expert_actions(
                     states[indices], targets[indices]
+                )
+                actions = safety_shield_actions(
+                    states[indices], targets[indices], expert_actions,
+                    walls, outside_walls,
                 )
             else:
                 actions = safety_shield_actions(
@@ -932,23 +1208,31 @@ def deterministic_evaluation(
             step_collisions = np.zeros(indices.size, dtype=bool)
             for local_index, (env_index, action) in enumerate(zip(indices, actions)):
                 data = data_batch[env_index]
-                data.xfrc_applied[ball_body_id, :2] = action
-                mujoco.mj_step(mujoco_model, data)
-                next_states[local_index] = np.hstack((data.qpos[:2], data.qvel[:2]))
+                step_training_simulation(
+                    mujoco_model, data, ball_body_id, action
+                )
+                next_states[local_index] = simulation_state(
+                    mujoco_model, data, ball_body_id
+                )
                 step_collisions[local_index] = wall_collision(mujoco_model, data)
 
             new_distances = np.linalg.norm(
-                next_states[:, :2] - goal_position, axis=1
+                next_states[:, :3] - goal_position, axis=1
             )
             rewards = -2.0 * new_distances - 0.01
             old_waypoint_distances = np.linalg.norm(
-                targets[indices] - states[indices, :2], axis=1
+                targets[indices] - states[indices, :3], axis=1
             )
             new_waypoint_distances = np.linalg.norm(
-                targets[indices] - next_states[:, :2], axis=1
+                targets[indices] - next_states[:, :3], axis=1
             )
-            rewards += 10.0 * (
+            rewards += 30.0 * (
                 old_waypoint_distances - new_waypoint_distances
+            )
+            rewards -= 0.01 * np.sum(actions * actions, axis=1)
+            rewards -= 0.25 * (
+                (new_waypoint_distances > epsilon)
+                & (np.linalg.norm(next_states[:, 3:6], axis=1) < 0.01)
             )
             reached_goal = new_distances <= epsilon
             rewards += reached_goal * 100.0
@@ -1028,9 +1312,7 @@ def ppo_training(
         starting_positions.extend(states[:, :2].copy().tolist())
         data_batch = [mujoco.MjData(mujoco_model) for _ in range(current_size)]
         for state, data in zip(states, data_batch):
-            data.qpos[:2] = state[:2]
-            data.qvel[:2] = state[2:]
-            mujoco.mj_forward(mujoco_model, data)
+            set_simulation_state(mujoco_model, data, state, ball_body_id)
         paths = create_episode_paths(states, goal_position, walls, outside_walls)
         waypoint_indices = np.ones(current_size, dtype=np.int32)
 
@@ -1078,24 +1360,32 @@ def ppo_training(
             step_collisions = np.zeros(current_size, dtype=bool)
             for env_index in np.flatnonzero(valid):
                 data = data_batch[env_index]
-                data.xfrc_applied[ball_body_id, :2] = actions_cpu[env_index]
-                mujoco.mj_step(mujoco_model, data)
-                next_states[env_index] = np.hstack((data.qpos[:2], data.qvel[:2]))
+                step_training_simulation(
+                    mujoco_model, data, ball_body_id, actions_cpu[env_index]
+                )
+                next_states[env_index] = simulation_state(
+                    mujoco_model, data, ball_body_id
+                )
                 step_collisions[env_index] = wall_collision(mujoco_model, data)
 
-            new_distances = np.linalg.norm(next_states[:, :2] - goal_position, axis=1)
+            new_distances = np.linalg.norm(next_states[:, :3] - goal_position, axis=1)
             rewards = -2.0 * new_distances - 0.01
             old_waypoint_distances = np.linalg.norm(
-                targets - states[:, :2], axis=1
+                targets - states[:, :3], axis=1
             )
             new_waypoint_distances = np.linalg.norm(
-                targets - next_states[:, :2], axis=1
+                targets - next_states[:, :3], axis=1
             )
-            rewards += 10.0 * (
+            rewards += 30.0 * (
                 old_waypoint_distances - new_waypoint_distances
             )
+            rewards -= 0.01 * np.sum(actions_cpu * actions_cpu, axis=1)
+            rewards -= 0.25 * (
+                (new_waypoint_distances > epsilon)
+                & (np.linalg.norm(next_states[:, 3:6], axis=1) < 0.01)
+            )
             rewards -= 2.0 * segment_cross_track_distances(
-                next_states[:, :2], segment_starts, targets
+                next_states[:, :3], segment_starts, targets
             )
             reached_goal = (new_distances <= epsilon) & valid
             rewards += reached_goal * 100.0
@@ -1237,7 +1527,7 @@ def ppo_training(
     return model
 
 def calculate_reward(state, goal_position, epsilon, t):
-    distance_to_goal = np.linalg.norm(state[:2] - goal_position)
+    distance_to_goal = np.linalg.norm(state[:3] - goal_position)
     reward = -distance_to_goal * 2
     if distance_to_goal <= epsilon:
         reward += 100
@@ -1256,16 +1546,16 @@ def random_position(
     while True:
         x = random.uniform(x_min, x_max)
         y = random.uniform(y_min, y_max)
-        vx, vy = 0.0, 0.0
+        z = outside_walls["z_max"]
         far_enough_from_goal = (
-            np.linalg.norm(np.array([x, y]) - goal_position)
+            np.linalg.norm(np.array([x, y, z]) - goal_position)
             >= minimum_goal_distance
         )
         if (
             not is_inside_wall(x, y, walls, outside_walls, safety_margin)
             and far_enough_from_goal
         ):
-            return np.array([x, y, vx, vy])
+            return np.array([x, y, z, 0.0, 0.0, 0.0])
 
 def is_inside_wall(x, y, walls, outside_walls, safety_margin=0.025):
     # Outside boundary
@@ -1343,42 +1633,50 @@ def plot_starting_points(starting_positions, goal_position, outside_walls, wall,
     return
 
 def main():
+    from .commands import parse_destination
     
     # Select device: GPU if available, otherwise CPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
-    goal_position = np.array([0.8, 0.0])  
+    goal_position = np.array([0.8, 0.0, 0.15])
+    destination_positions = {
+        "start": np.array([0.0, 0.0, 0.15]),
+        "goal": goal_position,
+        "underwater": np.array([0.9, -0.22, 0.06]),
+    }
     epsilon = 0.1
 
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    environment_path = os.path.join(project_root, "env", "ball_square.xml")
+    models_directory = os.path.join(project_root, "models")
+    os.makedirs(models_directory, exist_ok=True)
+
     # Load MuJoCo model
-    mujoco_model = mujoco.MjModel.from_xml_path("ball_square.xml")
-    mujoco_model.opt.timestep = 0.1
+    mujoco_model = mujoco.MjModel.from_xml_path(environment_path)
+    mujoco_model.opt.timestep = CONTROL_TIMESTEP
     mujoco_data = mujoco.MjData(mujoco_model)
     walls, outside_walls, spawn_margin = environment_geometry(
         mujoco_model, mujoco_data
     )
 
     # Create and move Actor-Critic Model to the chosen device
-    model = ActorCriticModel(input_dim=6, hidden_dim1=32, hidden_dim2=64, hidden_dim3=32, action_dim=2).to(device)
-    checkpoint_path = os.path.join(os.path.dirname(__file__), "best_ppo_model.pt")
+    model = ActorCriticModel(input_dim=9, hidden_dim1=32, hidden_dim2=64, hidden_dim3=32, action_dim=3).to(device)
+    checkpoint_path = os.path.join(models_directory, "best_ppo_model.pt")
+
+    current_state = np.array([0.0, 0.0, 0.15, 0.0, 0.0, 0.0])
+    checkpoint_loaded = False
 
     while True:
         print("\nMenu:")
-        print("1. Render best model from a random start")
-        print("2. Train PPO")
-        print("3. Render best model from the fixed start")
-        print("4. Quit")
+        print("Tell the robot to go to 'goal', 'start', or 'underwater'")
+        print("Other commands: train, random, quit")
 
-        choice = input("Enter your choice: ")
-        if choice.isdigit():
-            choice = int(choice)
-        else:
-            print("Invalid input. Please enter a number.")
-            continue
+        command = input("Command: ").strip()
+        choice = parse_destination(command)
 
-        if choice in (1, 3):
-            if os.path.exists(checkpoint_path):
+        if choice is not None or command.lower() == "random":
+            if os.path.exists(checkpoint_path) and not checkpoint_loaded:
                 checkpoint = torch.load(
                     checkpoint_path, map_location=device, weights_only=False
                 )
@@ -1390,6 +1688,7 @@ def main():
                         "Run option 2 to train the wall-aware PPO model first."
                     )
                     continue
+                checkpoint_loaded = True
                 evaluation = checkpoint.get("evaluation", {})
                 print(
                     "Loaded best PPO model"
@@ -1399,25 +1698,30 @@ def main():
                 print(
                     "No PPO checkpoint found; rendering the current in-memory model."
                 )
-            fixed_start = choice == 3
-            print(
-                "Rendering from the fixed start..."
-                if fixed_start else "Rendering from a random start..."
-            )
-            render_trained_policy(
+            if command.lower() == "random":
+                destination = goal_position
+                initial_state = None
+                print("Starting randomly and navigating to the goal...")
+            else:
+                destination = destination_positions[choice]
+                initial_state = current_state
+                print(f"Navigating to {choice} at {tuple(destination)}...")
+            _, current_state = render_trained_policy(
                 model=model,
-                goal_position=goal_position,
+                goal_position=destination,
                 walls=walls,
                 outside_walls=outside_walls,
                 mujoco_model=mujoco_model,
                 mujoco_data=mujoco_data,
                 epsilon=epsilon,
                 spawn_margin=spawn_margin,
-                fixed_start=fixed_start,
+                initial_state=initial_state,
+                interactive=True,
+                destination_positions=destination_positions,
                 device=device,
             )
 
-        elif choice == 2:
+        elif command.lower() == "train":
             print("Training the network...")
             num_training_episodes = 360
             model = ppo_training(
@@ -1436,8 +1740,8 @@ def main():
                 device=device  # pass device here
             )
 
-        elif choice == 4:
+        elif command.lower() in {"quit", "exit"}:
             print("Goodbye!")
             break
         else:
-            print("Invalid choice. Please select from the menu.")
+            print("I couldn't identify a destination. Say 'start', 'goal', or 'underwater'.")

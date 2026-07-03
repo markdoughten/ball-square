@@ -1,0 +1,5 @@
+glfw==2.8.0
+matplotlib==3.10.0
+mujoco==3.2.6
+numpy==2.2.1
+torch==2.11.0+cu128

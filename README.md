@@ -1,31 +1,62 @@
-# Advanced-Robotics-MDP
-Let us revisit the same navigation problem that you solved in HW 1, and con-
-sider the following MDP:
+# Collision-Free PPO Navigation
 
-• Action at = (fx,t,fy,t), where fx,t is the force applied on the robot in the x-dimension, and fy,t is the force applied on the robot in the y-dimension. Both fx,t and fy,t are limited to values in the interval [−1 Newton, 1 Newton].
+A MuJoCo ball-navigation environment using PPO, RRT path planning, PID imitation
+pretraining, and a safety controller for collision-free obstacle avoidance.
+Interactive navigation uses 3D RRT waypoints. The planner includes obstacle
+height, ball clearance, and water depth, allowing a surface-floating robot to
+travel over an obstacle when the waterline provides sufficient clearance.
+Routes are sampled freely throughout the water volume rather than being forced
+to cross at the surface and dive vertically. The single underwater goal uses a
+strict 1 cm tolerance.
+The PPO actor controls X, Y, and Z force. Its observation contains world-space
+position `(x, y, z)`, velocity `(vx, vy, vz)`, and 3D waypoint error, giving a
+9-input/3-output network. Existing 2D checkpoints are incompatible; run the
+`train` command to create `models/best_ppo_model.pt`.
+The normalized policy outputs drive control-limited motors with 15 N horizontal
+authority and 80 N vertical authority for diving against buoyancy. Training
+uses 0.01 s physics substeps, progress/stagnation
+rewards, a small motor-energy penalty, and an emergency velocity-braking shield.
 
-• State st = (xt,yt,x ̇t,y ̇t) is the position and velocity of the robot. At the beginning of each episode, the initial state is obtained by sampling the position of the robot uniformly in the workspace of the robot, and setting its initial velocity to 0.
+## Run
 
-• The transition function is defined as follows:
+```powershell
+cd src
+..\.venv\Scripts\python.exe app.py
+```
 
-       x ̇ t+1 = x ̇ t + (fx,t − ρx,t )∆t
-       
-       y ̇t+1 = y ̇t + (fy,t − ρy,t)∆t
-       
-       xt+1 = xt+x ̇t∆t
-       
-       yt+1 = xt+y ̇t∆t
-    
+At the command prompt, type a natural-language instruction containing `goal` or
+`start` (for example, `go to the goal` or `return home`). The robot preserves its
+position between commands and plans a path to the single underwater goal
+`(0.9, -0.22, 0.06)` or start `(0, 0, 0.15)`. There is no surface goal. While
+the simulation window is running, type `start` or `goal` in the
+terminal and press Enter to redirect the robot immediately from its current
+position. The `underwater` command sends it to `(0.9, -0.22, 0.06)` inside the
+translucent blue tank, where density, viscosity, current, pressure drag, partial
+submersion, and added-mass forces are applied. Type `quit` to close the simulation. Other main-menu commands are
+`train`, `random`, and `quit`.
+The tank is filled from the floor to `z = 0.15`, above the central obstacle
+(`z = 0.10`) and below the outer wall tops (`z = 0.20`).
+The water velocity and pressure evolve through a 3D incompressible
+Navier–Stokes solver with semi-Lagrangian advection, viscous diffusion,
+pressure projection, inlet/outlet flow, a free-surface boundary, and no-slip
+floor and obstacle boundaries. Each fluid cell stores `(u, v, w)` velocity and
+pressure. The
+robot has a vertical joint and receives Archimedes buoyancy
+`F_b = density * gravity * submerged_volume` plus vertical drag.
+Two-way immersed-boundary coupling makes the ball enforce a moving no-slip
+boundary and returns the equal-and-opposite drag/added-mass impulse to nearby
+fluid cells, producing a wake. Fixed walls and the center obstacle exchange
+momentum through their no-slip constraints.
+With the simulation window focused, use the arrow keys to change the current
+direction. The inlet turns gradually at 60 degrees per second while preserving
+flow speed, and the Navier–Stokes field evolves continuously.
+Time-varying divergence-free eddies and vorticity confinement add turbulence.
+Buoyancy is calibrated so the robot rises when fully submerged and settles at
+the water surface with half its spherical volume submerged; vertical drag
+damps oscillation around the waterline.
 
-where ρx,t and ρy,t are small independent noises, sampled from N (0, 0.1) at each time-step t, and ∆t is set to 0.1 seconds. We are assuming here that the robot has a mass of 1 Kg. You can imagine the force noises as air resistance or random friction (although air resistance should scale up as a function of velocity).
+Simulation camera controls: use the mouse wheel to zoom, left-drag to orbit,
+Shift+left-drag for horizontal orbit, right-drag to pan horizontally, and
+middle-drag to pan vertically.
 
-• The reward function is defined as: R(st) = 1 if ∥st − sg∥2 ≤ ε, and R(st) = 0 otherwise. sg = (xg, yg, 0, 0). It’s up to you to choose the values of the goal coordinates (xg,yg), but they should be fixed in advance. It’s also up to you to choose a reasonable value for the goal threshold ε.
-
-• Set the discount factor γ = 0.99.
-
-What you need to do:
-1. Leverage the Mujoco setup you had in HW 1 and modify it to simulate the MDP described above.
-2. Design a small actor neural network that predicts actions at ∼ πθ(st) as Gaussians, and a second small critic network that predicts values vw(st) of policy πθ.
-3. Implement the actor-critic algorithm explained in slide 40 of the lecture “Policy Gradients and Actor Critics”. It is up to you to define the length of the episodes (horizon) and the gradient step-sizes.
-4. Report the average reward per step as a function of the number of episodes that you used for training. This is called the learning curve.
-5. Submit the code and a small writeup on canvas. The writeup includes an explanation of what you did, and the results (the learning curve).
+Model checkpoints are generated artifacts and are intentionally ignored by Git.

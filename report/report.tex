@@ -449,4 +449,268 @@ Wikipedia contributors, "Ziegler--Nichols method," \textit{Wikipedia},
     \label{fig:trials}
 \end{figure}
 
+\clearpage
+\part{3D Fluid Navigation Extension}
+
+\section{Scope of the Extension}
+
+The original collision-free PPO implementation described in the preceding part
+was extended from planar navigation to controlled motion through a three-dimensional
+fluid volume.  This part records the extension without replacing the earlier
+baseline.  The current system adds a volumetric incompressible-flow solver,
+buoyancy, turbulence, two-way fluid--structure interaction, three-axis motor
+control, unrestricted 3D RRT planning, and a single submerged goal.
+
+The updated state and action are
+\[
+s_t=(x_t,y_t,z_t,\dot{x}_t,\dot{y}_t,\dot{z}_t),
+\qquad
+a_t=(F_{x,t},F_{y,t},F_{z,t}).
+\]
+The policy observation contains the six physical state variables and the 3D
+displacement to the active waypoint, giving nine inputs.  The actor produces
+three normalized motor commands.  The horizontal motors provide up to
+\(15\,\mathrm{N}\) in each direction, while the vertical motor provides up to
+\(80\,\mathrm{N}\) so that the robot can descend against buoyancy.  Controller
+updates occur every \(0.02\,\mathrm{s}\), with two \(0.01\,\mathrm{s}\) MuJoCo
+physics substeps per control update.
+
+\section{Fluid Environment}
+
+\subsection{Tank and Goal Geometry}
+
+The visible water is a translucent, non-colliding MuJoCo box.  It fills the tank
+from \(z=0\) to \(z=0.15\), above the central obstacle top at \(z=0.10\) and
+below the boundary-wall tops at \(z=0.20\).  The only navigation goal is a sphere
+centered at
+\[
+g=(0.9,-0.22,0.06),
+\]
+with a strict 3D success radius of \(0.01\,\mathrm{m}\).  There is no surface
+goal.  The application reports the final 3D position and Euclidean distance
+when it declares success.
+
+Training starts are sampled throughout the safe water depth.  The tank floor is
+\(z=0\), while the ball center is sampled from \(z=0.02\) to \(z=0.15\) to
+respect its \(0.02\,\mathrm{m}\) radius.  Samples inside the central obstacle
+volume are rejected; samples above the obstacle are valid.  Figure
+\ref{fig:fluid_starts} shows the resulting volumetric distribution.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{images/fluid/starting_positions.png}
+    \caption{Three-dimensional training starts, tank bounds, obstacle volume,
+    and the single underwater goal.}
+    \label{fig:fluid_starts}
+\end{figure}
+
+\subsection{Three-Dimensional Navier--Stokes Solver}
+
+The water state is discretized on a \(32\times18\times10\) Eulerian grid.  Each
+cell stores pressure \(p\) and velocity \(\mathbf{u}=(u,v,w)\).  The solver
+advances the incompressible Navier--Stokes equations
+\[
+\frac{\partial\mathbf{u}}{\partial t}
++(\mathbf{u}\cdot\nabla)\mathbf{u}
+=-\frac{1}{\rho}\nabla p
++\nu\nabla^2\mathbf{u}
++\mathbf{f},
+\qquad
+\nabla\cdot\mathbf{u}=0.
+\]
+Water density is \(\rho=997\,\mathrm{kg/m^3}\), dynamic viscosity is
+\(\mu=8.9\times10^{-4}\,\mathrm{Pa\,s}\), and kinematic viscosity is
+\(\nu=8.93\times10^{-7}\,\mathrm{m^2/s}\).  A semi-Lagrangian backtrace
+performs advection, Jacobi iterations apply implicit viscous diffusion, and a
+pressure Poisson solve projects the velocity onto a divergence-free field.
+The tank floor and central obstacle use no-slip conditions.  The upper grid
+boundary is a free surface with zero normal flow and a zero normal gradient for
+the tangential velocity.  Inlet and outlet boundaries follow the selected
+current direction.  Arrow keys rotate that direction gradually at
+\(60^\circ/\mathrm{s}\) while preserving current speed.
+
+\subsection{Turbulence}
+
+Large-scale, time-varying, divergence-free eddies inject turbulent energy into
+all three velocity components.  Semi-Lagrangian numerical damping is offset by
+vorticity confinement,
+\[
+\mathbf{f}_{\omega}=\epsilon
+\frac{\nabla\lVert\boldsymbol{\omega}\rVert}
+{\lVert\nabla\lVert\boldsymbol{\omega}\rVert\rVert}
+\times\boldsymbol{\omega},
+\qquad
+\boldsymbol{\omega}=\nabla\times\mathbf{u}.
+\]
+After 400 solver steps, the measured mean speed is
+\(0.055\,\mathrm{m/s}\), the 95th-percentile speed is
+\(0.141\,\mathrm{m/s}\), and the maximum is \(0.261\,\mathrm{m/s}\).
+The 95th-percentile vorticity magnitude is \(4.97\,\mathrm{s^{-1}}\), with a
+maximum of \(11.81\,\mathrm{s^{-1}}\).  Relative to the
+\(0.025\,\mathrm{m/s}\) inlet current, this represents medium-to-strong
+turbulence.  Figure \ref{fig:fluid_turbulence} plots velocity direction and
+magnitude with arrows; arrow color represents vorticity magnitude.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.98\textwidth]{images/fluid/turbulence.png}
+    \caption{Developed 3D turbulent velocity field.  Arrow direction and length
+    represent local velocity; color represents vorticity magnitude in
+    \(\mathrm{s^{-1}}\).}
+    \label{fig:fluid_turbulence}
+\end{figure}
+
+\section{Hydrodynamic Forces and Fluid--Structure Interaction}
+
+The dominant hydrodynamic forces on the spherical robot are evaluated from the
+local flow around its surface.  Relative velocity
+\(\mathbf{v}_r=\mathbf{v}_{\mathrm{robot}}-\mathbf{u}\) produces quadratic
+form drag and low-speed Stokes drag,
+\[
+\mathbf{F}_{D}
+=-\frac{1}{2}\rho C_D A\lVert\mathbf{v}_r\rVert\mathbf{v}_r
+-6\pi\mu r\mathbf{v}_r,
+\qquad C_D=0.47,quad A=\pi r^2.
+\]
+An added-mass term opposes acceleration of the surrounding displaced water,
+using an added-mass coefficient of \(0.5\).
+
+For a sphere intersecting the free surface, submerged volume is evaluated as a
+spherical cap,
+\[
+V_{\mathrm{sub}}=\pi h^2\left(r-\frac{h}{3}\right),
+\]
+where \(h\) is clipped to \([0,2r]\).  Archimedes' force is
+\[
+F_B=\rho gV_{\mathrm{sub}}.
+\]
+The simulated robot mass is much larger than the literal displaced mass of its
+small visual sphere, so a calibrated displacement model is used: half
+submersion balances robot weight, full submersion provides upward restoring
+force, and depth-dependent motor feed-forward supplies exactly the force needed
+to hold each underwater waypoint.  This avoids the previous behavior in which
+a constant downward bias skipped shallow waypoints or pinned the robot to the
+tank floor.
+
+Coupling is two-way.  The ball is rasterized into the Eulerian grid as a moving
+no-slip immersed boundary.  The fluid applies drag and added-mass forces to the
+ball, and the equal-and-opposite impulse is distributed to nearby fluid cells,
+creating a wake.  The static obstacle, tank floor, and walls exchange momentum
+through their fixed no-slip constraints.
+
+\section{Three-Dimensional Planning and Control}
+
+The current RRT samples unrestricted \((x,y,z)\) configurations throughout the
+water volume.  It uses a step size of \(0.075\), goal bias of \(0.15\), and up
+to 2500 iterations.  Collision tests include the obstacle's height, ball
+radius, wall clearance, floor, and water surface.  Consequently, a path may go
+above the obstacle, around it, descend before it, or combine horizontal and
+vertical motion; underwater commands are not forced into a surface traversal
+followed by a vertical dive.
+
+Figure \ref{fig:fluid_rrt_paths} shows five representative plans from random
+depths.  The paths demonstrate that the planner uses the full volume: depending
+on the sampled start and tree growth, it can pass above or around the obstacle
+while changing depth progressively toward the underwater goal.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.98\textwidth]{images/fluid/rrt_paths_3d.png}
+    \caption{Five collision-free 3D RRT paths from random safe starting depths
+    to the single underwater goal.}
+    \label{fig:fluid_rrt_paths}
+\end{figure}
+
+The 3D PD expert uses horizontal position and velocity feedback.  Its vertical
+component is expressed in force units and includes hydrostatic feed-forward
+computed for the target waypoint depth.  PPO actions are accepted only when
+their dot product with the expert action is positive.  An aligned learned
+action receives at most 5\% authority; a disagreeing action receives none.
+Unsafe one-step predictions trigger velocity braking.  This alignment-aware
+shield is intentionally conservative because deterministic collision avoidance
+and accurate underwater arrival are higher priorities than policy autonomy.
+
+\section{Updated Reward and Training}
+
+The earlier absolute-distance reward produced a mostly negative, flat trace
+because distance cost dominated small per-step progress and the terminal bonus
+was diluted by per-step averaging.  The updated reward is progress-dominant:
+\[
+\begin{aligned}
+r_t={}&25\left(d_g(s_t)-d_g(s_{t+1})\right)
++10\left(d_{\mathrm{wp}}(s_t)-d_{\mathrm{wp}}(s_{t+1})\right)\\
+&-0.02d_g(s_{t+1})-0.002
+-0.5d_{\mathrm{cross}}(s_{t+1})
+-0.002\lVert a_t\rVert^2\\
+&-0.05\,\mathbb{1}_{\mathrm{stagnant}}
++25\,\mathbb{1}_{\mathrm{goal}}
+-25\,\mathbb{1}_{\mathrm{collision}}.
+\end{aligned}
+\]
+The learning chart now reports total episode return rather than mean reward per
+step.  Training uses 360 episodes, random starts at all safe depths, 30 epochs
+of imitation pretraining, batches of 64, six PPO epochs per batch, and a maximum
+of 2400 control steps per episode.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.92\textwidth]{images/fluid/learning_curve.png}
+    \caption{Episode return and ten-episode moving average for depth-randomized
+    underwater training.}
+    \label{fig:fluid_learning}
+\end{figure}
+
+The return is normally between approximately 30 and 45.  Four isolated large
+negative returns correspond to rare timeout or failed episodes; the moving
+average recovers immediately.  The absence of a strong upward trend is expected
+because imitation pretraining and expert shielding already provide high success
+at the beginning of PPO training.  Further reward shaping is not presently
+justified; a stronger test of policy learning would instead reduce expert
+authority gradually.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{images/fluid/loss_curves.png}
+    \caption{Critic and clipped PPO actor losses for the updated reward.}
+    \label{fig:fluid_losses}
+\end{figure}
+
+\section{Current Results}
+
+The best checkpoint was selected after 192 episodes.  Its stored evaluation over
+32 randomized-depth episodes reported 100\% success, 0\% collisions, and mean
+per-step reward \(0.0842\).  Table
+\ref{tab:fluid_checkpoint} summarizes the current result.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{lc}
+        \hline
+        \textbf{Metric} & \textbf{Current 3D fluid checkpoint} \\
+        \hline
+        Training episodes & 360 \\
+        Selected checkpoint episode & 192 \\
+        Stored evaluation success & 100\% \\
+        Collision rate & 0\% \\
+        Stored mean reward per step & 0.0842 \\
+        Goal radius & 0.01 m \\
+        \hline
+    \end{tabular}
+    \caption{Performance of the depth-randomized underwater controller.}
+    \label{tab:fluid_checkpoint}
+\end{table}
+
+\section{Fluid Extension Conclusion}
+
+The extension converts the original planar navigation problem into a
+three-dimensional underwater-control problem.  The system now combines a 3D
+Navier--Stokes approximation, medium-to-strong turbulence, calibrated buoyancy,
+two-way immersed-boundary coupling, volumetric RRT, three-axis motors, and a
+strict submerged target.  Random-depth training and independent evaluation
+show that the conservative hybrid controller maintains high success without
+recorded wall collisions.  Remaining work should quantify performance across
+multiple random seeds, compare the full solver with laminar and one-way-coupled
+ablations, and reduce expert authority gradually to measure the learned policy's
+independent contribution.
+
 \end{document}

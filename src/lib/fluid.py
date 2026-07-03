@@ -29,7 +29,8 @@ class NavierStokesField:
 
     def __init__(self, region, inlet_velocity, nx=32, ny=18, nz=10,
                  kinematic_viscosity=8.93e-7, pressure_iterations=16,
-                 turbulence_intensity=0.04, vorticity_confinement=0.03):
+                 turbulence_intensity=0.04, vorticity_confinement=0.03,
+                 seed=None):
         self.region = region
         self.nx, self.ny, self.nz = nx, ny, nz
         self.dx = (region.x_max-region.x_min)/(nx-1)
@@ -41,6 +42,10 @@ class NavierStokesField:
         self.pressure_iterations = pressure_iterations
         self.turbulence_intensity = turbulence_intensity
         self.vorticity_confinement = vorticity_confinement
+        self.rng = np.random.default_rng(seed)
+        self.turbulence_phases = self.rng.uniform(0.0, 2*np.pi, size=3)
+        self.turbulence_noise = np.zeros(3, dtype=np.float64)
+        self.turbulence_correlation_time = 0.35
         self.time = 0.0
         self.velocity = np.zeros((nz, ny, nx, 3), dtype=np.float64)
         self.velocity[:] = self.inlet_velocity
@@ -139,14 +144,31 @@ class NavierStokesField:
             self._apply_boundaries(velocity)
 
         self.time += dt
+        # Ornstein-Uhlenbeck modulation gives each run smooth random changes
+        # rather than unstable cell-wise white noise.  Each velocity component
+        # remains independent of its own axis, so the forcing is divergence-free.
+        decay = np.exp(-dt/self.turbulence_correlation_time)
+        self.turbulence_noise = (
+            decay*self.turbulence_noise
+            + np.sqrt(max(0.0, 1.0-decay**2))*self.rng.normal(size=3)
+        )
+        modulation = np.clip(1.0+0.25*self.turbulence_noise, 0.4, 1.6)
         lx, ly, lz = (self.region.x_max-self.region.x_min,
                       self.region.y_max-self.region.y_min,
                       self.region.surface_z-self.region.bottom_z)
         eddies = np.empty_like(velocity)
         # Each component is independent of its own axis, so this forcing is divergence-free.
-        eddies[..., 0] = np.sin(2*np.pi*(self.y-self.region.y_min)/ly+0.7*self.time)*np.cos(np.pi*self.z/lz)
-        eddies[..., 1] = np.sin(2*np.pi*self.z/lz+0.8*self.time)*np.cos(2*np.pi*(self.x-self.region.x_min)/lx)
-        eddies[..., 2] = np.sin(2*np.pi*(self.x-self.region.x_min)/lx-0.9*self.time)*np.cos(2*np.pi*(self.y-self.region.y_min)/ly)
+        eddies[..., 0] = modulation[0]*np.sin(
+            2*np.pi*(self.y-self.region.y_min)/ly+0.7*self.time
+            + self.turbulence_phases[0]
+        )*np.cos(np.pi*self.z/lz)
+        eddies[..., 1] = modulation[1]*np.sin(
+            2*np.pi*self.z/lz+0.8*self.time+self.turbulence_phases[1]
+        )*np.cos(2*np.pi*(self.x-self.region.x_min)/lx)
+        eddies[..., 2] = modulation[2]*np.sin(
+            2*np.pi*(self.x-self.region.x_min)/lx-0.9*self.time
+            + self.turbulence_phases[2]
+        )*np.cos(2*np.pi*(self.y-self.region.y_min)/ly)
         velocity += dt*self.turbulence_intensity*eddies
 
         omega = self.vorticity(velocity)
@@ -223,6 +245,7 @@ class FluidDynamics:
     neutral_buoyancy: bool = True
     surface_equilibrium_fraction: float = 0.5
     turn_rate: float = np.deg2rad(60.0)
+    turbulence_seed: int | None = None
     current_velocity: np.ndarray = dataclass_field(default_factory=lambda: np.array([-0.025, 0.0, 0.0]))
     _previous_velocity: np.ndarray | None = dataclass_field(default=None, init=False)
     field: NavierStokesField = dataclass_field(init=False)
@@ -232,11 +255,15 @@ class FluidDynamics:
         current = np.asarray(self.current_velocity, dtype=np.float64)
         self.current_velocity = np.pad(current, (0, max(0, 3-len(current))))[:3]
         self.target_current_velocity = self.current_velocity.copy()
-        self.field = NavierStokesField(self.region, self.current_velocity)
+        self.field = NavierStokesField(
+            self.region, self.current_velocity, seed=self.turbulence_seed
+        )
 
     def reset(self):
         self._previous_velocity = None
-        self.field = NavierStokesField(self.region, self.current_velocity)
+        self.field = NavierStokesField(
+            self.region, self.current_velocity, seed=self.turbulence_seed
+        )
 
     def set_current_direction(self, direction):
         direction = np.asarray(direction, dtype=np.float64)

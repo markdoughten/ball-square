@@ -5,6 +5,9 @@ pretraining, and a safety controller for collision-free obstacle avoidance.
 Interactive navigation uses 3D RRT waypoints. The planner includes obstacle
 height, ball clearance, and water depth, allowing a surface-floating robot to
 travel over an obstacle when the waterline provides sufficient clearance.
+Routes are sampled freely throughout the water volume rather than being forced
+to cross at the surface and dive vertically. The single underwater goal uses a
+strict 1 cm tolerance.
 The PPO actor controls X, Y, and Z force. Its observation contains world-space
 position `(x, y, z)`, velocity `(vx, vy, vz)`, and 3D waypoint error, giving a
 9-input/3-output network. Existing 2D checkpoints are incompatible; run the
@@ -23,8 +26,9 @@ cd src
 
 At the command prompt, type a natural-language instruction containing `goal` or
 `start` (for example, `go to the goal` or `return home`). The robot preserves its
-position between commands and plans a path to the goal `(0.8, 0.0)` or start
-`(0, 0)`. While the simulation window is running, type `start` or `goal` in the
+position between commands and plans a path to the single underwater goal
+`(0.9, -0.22, 0.06)` or start `(0, 0, 0.15)`. There is no surface goal. While
+the simulation window is running, type `start` or `goal` in the
 terminal and press Enter to redirect the robot immediately from its current
 position. The `underwater` command sends it to `(0.9, -0.22, 0.06)` inside the
 translucent blue tank, where density, viscosity, current, pressure drag, partial

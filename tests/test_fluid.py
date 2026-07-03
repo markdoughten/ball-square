@@ -77,6 +77,17 @@ class FluidDynamicsTests(unittest.TestCase):
         self.assertEqual(turbulent.vorticity().shape, (10, 12, 20, 3))
         self.assertTrue(np.isfinite(turbulent.vorticity()).all())
 
+    def test_turbulence_seed_controls_random_realization(self):
+        first = NavierStokesField(FluidRegion(), [-0.025, 0.0], seed=7)
+        repeated = NavierStokesField(FluidRegion(), [-0.025, 0.0], seed=7)
+        different = NavierStokesField(FluidRegion(), [-0.025, 0.0], seed=8)
+        for _ in range(3):
+            first.step(0.01)
+            repeated.step(0.01)
+            different.step(0.01)
+        np.testing.assert_allclose(first.velocity, repeated.velocity)
+        self.assertFalse(np.allclose(first.velocity, different.velocity))
+
     def test_current_direction_preserves_speed(self):
         fluid = FluidDynamics(current_velocity=np.array([-0.025, 0.0]))
         fluid.set_current_direction([0.0, 1.0])

@@ -6,6 +6,7 @@ import random
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import matplotlib as mpl
 import mujoco
 import glfw
 import os
@@ -14,6 +15,12 @@ PATH_CLEARANCE = 0.06
 POSITION_DIMENSIONS = 3
 MOTOR_FORCE_SCALE = np.array([15.0, 15.0, 80.0])
 CONTROL_TIMESTEP = 0.02
+
+
+def format_position(position, decimals=3):
+    return "(" + ", ".join(
+        f"{float(value):.{decimals}f}" for value in position
+    ) + ")"
 
 
 def simulation_state(model, data, body_id):
@@ -265,7 +272,7 @@ def render_trained_policy(
     active_goal = navigation_goal.copy()
     destination_positions = destination_positions or {
         "start": np.array([0.0, 0.0, outside_walls["z_max"]]),
-        "goal": np.array([0.8, 0.0, outside_walls["z_max"]]),
+        "goal": np.array([0.9, -0.22, 0.06]),
         "underwater": np.array([0.9, -0.22, 0.06]),
     }
     from .fluid import FluidDynamics
@@ -335,7 +342,8 @@ def render_trained_policy(
                         reached_goal = False
                         print(
                             f"Redirecting to {destination} at "
-                            f"{tuple(active_goal)} ({len(paths[0])} waypoints)."
+                            f"{format_position(active_goal)} "
+                            f"({len(paths[0])} waypoints)."
                         )
                     print("Command: ", end="", flush=True)
             physical_state = simulation_state(
@@ -366,7 +374,7 @@ def render_trained_policy(
                 camera, window, option,
             )
             goal_tolerance = (
-                min(epsilon, 0.03)
+                min(epsilon, 0.01)
                 if active_goal[2] < outside_walls["z_max"]-0.005
                 else epsilon
             )
@@ -377,7 +385,14 @@ def render_trained_policy(
                 ) <= goal_tolerance
             ):
                 reached_goal = True
-                print(f"Goal reached in {step} steps.")
+                goal_distance = np.linalg.norm(
+                    mujoco_data.xpos[ball_body_id, :3] - active_goal
+                )
+                print(
+                    f"Goal reached in {step} steps at "
+                    f"{format_position(mujoco_data.xpos[ball_body_id, :3], 4)}; "
+                    f"distance {goal_distance:.4f}."
+                )
                 if interactive:
                     print("Command: ", end="", flush=True)
                 else:
@@ -426,7 +441,8 @@ def environment_geometry(model, data, clearance=0.005):
         "x_min": float(left_max[0]), "x_max": float(right_min[0]),
         "y_min": float(bottom_max[1]), "y_max": float(top_min[1])
     }
-    outside_walls["z_min"] = max(float(water_min[2]), ball_radius)
+    outside_walls["z_floor"] = float(water_min[2])
+    outside_walls["z_min"] = max(outside_walls["z_floor"]+ball_radius, ball_radius)
     outside_walls["z_max"] = float(water_max[2])
     return walls, outside_walls, spawn_margin
 
@@ -570,9 +586,9 @@ def plan_rrt_path(
     walls,
     outside_walls,
     clearance=PATH_CLEARANCE,
-    max_iterations=1000,
-    step_size=0.10,
-    goal_bias=0.20,
+    max_iterations=2500,
+    step_size=0.075,
+    goal_bias=0.15,
 ):
     """Plan and smooth a collision-free RRT path for the ball center."""
     start = np.asarray(start, dtype=np.float64)
@@ -624,29 +640,29 @@ def plan_rrt_path(
 
 
 def plan_navigation_path(start, goal, walls, outside_walls):
-    """Plan at the surface first, then dive vertically for submerged goals."""
-    start = np.asarray(start, dtype=np.float64)
-    goal = np.asarray(goal, dtype=np.float64)
-    surface = outside_walls["z_max"]
-    if len(goal) == 3 and goal[2] < surface-0.005:
-        surface_goal = goal.copy()
-        surface_goal[2] = surface
-        surface_path = plan_rrt_path(
-            start, surface_goal, walls, outside_walls
-        )
-        if surface_path is None:
-            return None
-        dive = densify_path([surface_goal, goal], maximum_interval=0.02)
-        return surface_path+dive[1:]
+    """Plan an unrestricted volumetric route through the water."""
     return plan_rrt_path(start, goal, walls, outside_walls)
 
-def create_episode_paths(states, goal_position, walls, outside_walls):
+def create_episode_paths(
+    states, goal_position, walls, outside_walls,
+    planning_retries=3,
+):
+    """Plan every episode without changing its sampled starting state."""
     paths = []
-    for state in states:
-        path = plan_rrt_path(
-            state[:3], goal_position, walls, outside_walls
-        )
-        paths.append(path if path is not None else [state[:3], goal_position])
+    for index in range(len(states)):
+        path = None
+        for _ in range(planning_retries):
+            path = plan_rrt_path(
+                states[index, :3], goal_position, walls, outside_walls
+            )
+            if path is not None:
+                break
+        if path is None:
+            raise RuntimeError(
+                "Unable to plan a collision-free RRT path after "
+                f"{planning_retries} attempts for start {states[index, :3]}"
+            )
+        paths.append(path)
     return paths
 
 def current_path_targets(states, paths, waypoint_indices, tolerance=0.02):
@@ -676,7 +692,15 @@ def pid_expert_actions(states, targets, kp=6.0, kd=6.0):
     controls[:, :2] = np.tanh(
         kp*(targets[:, :2]-states[:, :2])-kd*states[:, 3:5]
     )
-    dive_feedforward = np.where(targets[:, 2] < 0.145, -55.0, 0.0)
+    ball_radius = 0.02
+    cap_height = np.clip(
+        0.15-(targets[:, 2]-ball_radius), 0.0, 2.0*ball_radius
+    )
+    target_volume = np.pi*cap_height**2*(ball_radius-cap_height/3.0)
+    sphere_volume = 4.0/3.0*np.pi*ball_radius**3
+    target_submersion = target_volume/sphere_volume
+    weight = 5.0*9.81
+    dive_feedforward = weight-weight*target_submersion/0.5
     vertical_force = (
         80.0*(targets[:, 2]-states[:, 2])
         - 50.0*states[:, 5]
@@ -716,7 +740,9 @@ def safety_shield_actions(
     brake[:, 2] = np.clip(
         -50.0*states[:, 5]/MOTOR_FORCE_SCALE[2], -1.0, 1.0
     )
-    actions = 0.10 * actions + 0.90 * expert
+    alignment = np.sum(actions*expert, axis=1)
+    blend = np.where(alignment > 0.0, 0.05, 0.0)[:, None]
+    actions = blend*actions + (1.0-blend)*expert
     predicted_positions = (
         states[:, :3] + states[:, 3:6] * CONTROL_TIMESTEP
         + actions * MOTOR_FORCE_SCALE * (CONTROL_TIMESTEP ** 2 / 5.0)
@@ -843,7 +869,7 @@ def actor_critic_training(
                 safety_margin=spawn_margin
             )
 
-        starting_positions.append(state[:2])
+        starting_positions.append(state[:3])
         
         # If MuJoCo is used, place the ball in MuJoCo as well
         if mujoco_model is not None and mujoco_data is not None:
@@ -995,7 +1021,7 @@ def actor_critic_batch_training(
             )
             for _ in range(current_batch_size)
         ])
-        starting_positions.extend(states[:, :2].copy().tolist())
+        starting_positions.extend(states[:, :3].copy().tolist())
 
         mujoco_batch = None
         if mujoco_model is not None:
@@ -1168,10 +1194,12 @@ def deterministic_evaluation(
     ball_body_id = mujoco.mj_name2id(
         mujoco_model, mujoco.mjtObj.mjOBJ_BODY, "ball"
     )
+    paths = create_episode_paths(
+        states, goal_position, walls, outside_walls,
+    )
     data_batch = [mujoco.MjData(mujoco_model) for _ in range(episodes)]
     for state, data in zip(states, data_batch):
         set_simulation_state(mujoco_model, data, state, ball_body_id)
-    paths = create_episode_paths(states, goal_position, walls, outside_walls)
     waypoint_indices = np.ones(episodes, dtype=np.int32)
     active = np.ones(episodes, dtype=bool)
     successes = np.zeros(episodes, dtype=bool)
@@ -1219,23 +1247,29 @@ def deterministic_evaluation(
             new_distances = np.linalg.norm(
                 next_states[:, :3] - goal_position, axis=1
             )
-            rewards = -2.0 * new_distances - 0.01
+            old_goal_distances = np.linalg.norm(
+                states[indices, :3] - goal_position, axis=1
+            )
+            rewards = (
+                25.0 * (old_goal_distances - new_distances)
+                - 0.02 * new_distances - 0.002
+            )
             old_waypoint_distances = np.linalg.norm(
                 targets[indices] - states[indices, :3], axis=1
             )
             new_waypoint_distances = np.linalg.norm(
                 targets[indices] - next_states[:, :3], axis=1
             )
-            rewards += 30.0 * (
+            rewards += 10.0 * (
                 old_waypoint_distances - new_waypoint_distances
             )
-            rewards -= 0.01 * np.sum(actions * actions, axis=1)
-            rewards -= 0.25 * (
+            rewards -= 0.002 * np.sum(actions * actions, axis=1)
+            rewards -= 0.05 * (
                 (new_waypoint_distances > epsilon)
                 & (np.linalg.norm(next_states[:, 3:6], axis=1) < 0.01)
             )
             reached_goal = new_distances <= epsilon
-            rewards += reached_goal * 100.0
+            rewards += reached_goal * 25.0
             rewards -= step_collisions * collision_penalty
 
             states[indices] = next_states
@@ -1275,6 +1309,7 @@ def ppo_training(
     imitation_epochs=30,
     checkpoint_path="best_ppo_model.pt",
     plot=False,
+    plot_directory=None,
     device=torch.device("cpu"),
 ):
     """Train with clipped PPO, GAE, deterministic evaluation, and checkpointing."""
@@ -1309,11 +1344,13 @@ def ppo_training(
             )
             for _ in range(current_size)
         ])
-        starting_positions.extend(states[:, :2].copy().tolist())
+        paths = create_episode_paths(
+            states, goal_position, walls, outside_walls,
+        )
+        starting_positions.extend(states[:, :3].copy().tolist())
         data_batch = [mujoco.MjData(mujoco_model) for _ in range(current_size)]
         for state, data in zip(states, data_batch):
             set_simulation_state(mujoco_model, data, state, ball_body_id)
-        paths = create_episode_paths(states, goal_position, walls, outside_walls)
         waypoint_indices = np.ones(current_size, dtype=np.int32)
 
         active = np.ones(current_size, dtype=bool)
@@ -1369,26 +1406,32 @@ def ppo_training(
                 step_collisions[env_index] = wall_collision(mujoco_model, data)
 
             new_distances = np.linalg.norm(next_states[:, :3] - goal_position, axis=1)
-            rewards = -2.0 * new_distances - 0.01
+            old_goal_distances = np.linalg.norm(
+                states[:, :3] - goal_position, axis=1
+            )
+            rewards = (
+                25.0 * (old_goal_distances - new_distances)
+                - 0.02 * new_distances - 0.002
+            )
             old_waypoint_distances = np.linalg.norm(
                 targets - states[:, :3], axis=1
             )
             new_waypoint_distances = np.linalg.norm(
                 targets - next_states[:, :3], axis=1
             )
-            rewards += 30.0 * (
+            rewards += 10.0 * (
                 old_waypoint_distances - new_waypoint_distances
             )
-            rewards -= 0.01 * np.sum(actions_cpu * actions_cpu, axis=1)
-            rewards -= 0.25 * (
+            rewards -= 0.002 * np.sum(actions_cpu * actions_cpu, axis=1)
+            rewards -= 0.05 * (
                 (new_waypoint_distances > epsilon)
                 & (np.linalg.norm(next_states[:, 3:6], axis=1) < 0.01)
             )
-            rewards -= 2.0 * segment_cross_track_distances(
+            rewards -= 0.5 * segment_cross_track_distances(
                 next_states[:, :3], segment_starts, targets
             )
             reached_goal = (new_distances <= epsilon) & valid
-            rewards += reached_goal * 100.0
+            rewards += reached_goal * 25.0
             rewards -= step_collisions * collision_penalty
             timed_out = valid & (step == max_steps - 1)
             dones = reached_goal | step_collisions | timed_out
@@ -1477,8 +1520,7 @@ def ppo_training(
                 actor_losses.append(actor_loss.item())
                 critic_losses.append(critic_loss.item())
 
-        averaged_rewards = total_rewards / np.maximum(step_counts, 1)
-        episode_rewards.extend(averaged_rewards.tolist())
+        episode_rewards.extend(total_rewards.tolist())
         all_successes.extend(successes.tolist())
         all_collisions.extend(collisions.tolist())
         evaluation = deterministic_evaluation(
@@ -1520,10 +1562,29 @@ def ppo_training(
         "evaluations": evaluations,
         "best_evaluation": checkpoint["evaluation"],
     }
-    if plot:
-        plot_starting_points(starting_positions, goal_position, outside_walls, walls, epsilon)
-        plot_learning_curve(episode_rewards)
-        plot_loss_curve(critic_losses, actor_losses)
+    if plot or plot_directory:
+        if plot_directory:
+            os.makedirs(plot_directory, exist_ok=True)
+        plot_starting_points(
+            starting_positions, goal_position, outside_walls, walls, epsilon,
+            output_path=(os.path.join(plot_directory, "starting_positions.png")
+                         if plot_directory else None),
+        )
+        plot_learning_curve(
+            episode_rewards,
+            output_path=(os.path.join(plot_directory, "learning_curve.png")
+                         if plot_directory else None),
+        )
+        plot_loss_curve(
+            critic_losses, actor_losses,
+            output_path=(os.path.join(plot_directory, "loss_curves.png")
+                         if plot_directory else None),
+        )
+        if plot_directory:
+            plot_turbulence(
+                walls,
+                os.path.join(plot_directory, "turbulence.png"),
+            )
     return model
 
 def calculate_reward(state, goal_position, epsilon, t):
@@ -1546,29 +1607,39 @@ def random_position(
     while True:
         x = random.uniform(x_min, x_max)
         y = random.uniform(y_min, y_max)
-        z = outside_walls["z_max"]
+        z = random.uniform(outside_walls["z_min"], outside_walls["z_max"])
         far_enough_from_goal = (
             np.linalg.norm(np.array([x, y, z]) - goal_position)
             >= minimum_goal_distance
         )
         if (
-            not is_inside_wall(x, y, walls, outside_walls, safety_margin)
+            not is_inside_wall(
+                x, y, walls, outside_walls, safety_margin, z=z
+            )
             and far_enough_from_goal
         ):
             return np.array([x, y, z, 0.0, 0.0, 0.0])
 
-def is_inside_wall(x, y, walls, outside_walls, safety_margin=0.025):
+def is_inside_wall(
+    x, y, walls, outside_walls, safety_margin=0.025, z=None
+):
     # Outside boundary
     if not (outside_walls['x_min'] + safety_margin <= x <= outside_walls['x_max'] - safety_margin and
             outside_walls['y_min'] + safety_margin <= y <= outside_walls['y_max'] - safety_margin):
         return True
     # Inside the internal wall
-    if (walls['x_min'] - safety_margin <= x <= walls['x_max'] + safety_margin and
-            walls['y_min'] - safety_margin <= y <= walls['y_max'] + safety_margin):
+    overlaps_xy = (
+        walls['x_min'] - safety_margin <= x <= walls['x_max'] + safety_margin
+        and walls['y_min'] - safety_margin <= y <= walls['y_max'] + safety_margin
+    )
+    # Use ball-radius clearance vertically rather than the wider planar RRT
+    # margin, allowing safe spawns above the obstacle.
+    overlaps_z = z is None or z <= walls["z_max"]+0.025
+    if overlaps_xy and overlaps_z:
         return True
     return False
 
-def plot_loss_curve(critic_losses, actor_losses):
+def plot_loss_curve(critic_losses, actor_losses, output_path=None):
     figure, (critic_axis, actor_axis) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
     critic_axis.plot(critic_losses, color="tab:blue", alpha=0.7)
     critic_axis.set_ylabel("Critic Loss")
@@ -1582,55 +1653,216 @@ def plot_loss_curve(critic_losses, actor_losses):
     actor_axis.grid(alpha=0.2)
 
     figure.tight_layout()
-    plt.show()
+    if output_path:
+        figure.savefig(output_path, dpi=180, bbox_inches="tight")
+        plt.close(figure)
+    else:
+        plt.show()
     return
 
-def plot_learning_curve(episode_rewards):
+def plot_learning_curve(episode_rewards, output_path=None):
     window_size = 10  # Adjust for smoothing
     moving_avg_rewards = np.convolve(episode_rewards, np.ones(window_size) / window_size, mode='valid')
-    plt.figure(figsize=(10, 6))
-    plt.plot(episode_rewards, label="Avg. Reward per Episode", alpha=0.5)
-    plt.plot(range(window_size - 1, len(episode_rewards)), moving_avg_rewards,
+    figure, axis = plt.subplots(figsize=(10, 6))
+    axis.plot(episode_rewards, label="Avg. Reward per Episode", alpha=0.5)
+    axis.plot(range(window_size - 1, len(episode_rewards)), moving_avg_rewards,
              label=f"Moving Average (window={window_size})", color='orange')
-    plt.xlabel("Episode")
-    plt.ylabel("Avg. Reward")
-    plt.title("Learning Curve with Moving Average")
-    plt.legend()
-    plt.show()
+    axis.set_xlabel("Episode")
+    axis.set_ylabel("Episode Return")
+    axis.set_title("Episode Return with Moving Average")
+    axis.legend()
+    if output_path:
+        figure.savefig(output_path, dpi=180, bbox_inches="tight")
+        plt.close(figure)
+    else:
+        plt.show()
     return 
 
-def plot_starting_points(starting_positions, goal_position, outside_walls, wall, epsilon):
-    plt.figure(figsize=(10, 8))
-    starting_positions = np.array(starting_positions)
-    plt.scatter(starting_positions[:, 0], starting_positions[:, 1], color='blue', label='Starting Positions')
-    plt.scatter(goal_position[0], goal_position[1], color='red', marker='*', s=150, label='Goal Position')
-
-    epsilon_circle = patches.Circle((goal_position[0], goal_position[1]), epsilon,
-                                     color='green', alpha=0.2, label=f"Epsilon Radius ({epsilon})")
-    plt.gca().add_patch(epsilon_circle)
-
-    x_min, x_max = outside_walls['x_min'], outside_walls['x_max']
-    y_min, y_max = outside_walls['y_min'], outside_walls['y_max']
-    boundary = patches.Rectangle((x_min, y_min), x_max - x_min, y_max - y_min,
-                                  edgecolor="black", facecolor="none", linewidth=2, label="Outside Walls")
-    plt.gca().add_patch(boundary)
-
-    x_min = wall['x_min']
-    x_max = wall['x_max']
-    y_min = wall['y_min']
-    y_max = wall['y_max']
-    rectangle = patches.Rectangle((x_min, y_min), x_max - x_min, y_max - y_min,
-                                   color='grey', alpha=0.5, label="Wall")
-    plt.gca().add_patch(rectangle)
-
-    plt.xlabel("X Position")
-    plt.ylabel("Y Position")
-    plt.title("Starting Points and Environment Layout")
-    plt.legend()
-    plt.grid(True)
-    plt.axis("equal")
-    plt.show()
+def plot_starting_points(
+    starting_positions, goal_position, outside_walls, wall, epsilon,
+    output_path=None,
+):
+    figure = plt.figure(figsize=(13, 8))
+    figure.subplots_adjust(left=0.05, right=0.88, bottom=0.14, top=0.90)
+    axis = figure.add_subplot(111, projection="3d")
+    starting_positions = np.asarray(starting_positions)
+    axis.scatter(
+        starting_positions[:, 0], starting_positions[:, 1],
+        starting_positions[:, 2], color="tab:blue", s=16, alpha=0.65,
+        label="Starting positions",
+    )
+    axis.scatter(
+        *goal_position[:3], color="black", marker="x", s=28,
+        depthshade=False, label="Goal center",
+    )
+    longitude, latitude = np.meshgrid(
+        np.linspace(0, 2*np.pi, 30), np.linspace(0, np.pi, 16)
+    )
+    axis.plot_surface(
+        goal_position[0]+epsilon*np.cos(longitude)*np.sin(latitude),
+        goal_position[1]+epsilon*np.sin(longitude)*np.sin(latitude),
+        goal_position[2]+epsilon*np.cos(latitude),
+        color="cyan", alpha=0.25, linewidth=0,
+    )
+    axis.bar3d(
+        wall["x_min"], wall["y_min"], wall["z_min"],
+        wall["x_max"]-wall["x_min"],
+        wall["y_max"]-wall["y_min"],
+        wall["z_max"]-wall["z_min"],
+        color="grey", alpha=0.55, shade=True, label="Obstacle",
+    )
+    x_values = [outside_walls["x_min"], outside_walls["x_max"]]
+    y_values = [outside_walls["y_min"], outside_walls["y_max"]]
+    z_values = [outside_walls.get("z_floor", 0.0), outside_walls["z_max"]]
+    corners = [(x, y, z) for x in x_values for y in y_values for z in z_values]
+    for index, first in enumerate(corners):
+        for second in corners[index+1:]:
+            if sum(a != b for a, b in zip(first, second)) == 1:
+                axis.plot(*zip(first, second), color="black", alpha=0.5)
+    axis.set_xlabel("X Position")
+    axis.set_ylabel("Y Position")
+    axis.set_zlabel("Z Position")
+    axis.xaxis.labelpad = 18
+    axis.yaxis.labelpad = 18
+    axis.zaxis.labelpad = 12
+    axis.tick_params(axis="x", pad=2, labelsize=9)
+    axis.tick_params(axis="y", pad=2, labelsize=9)
+    axis.tick_params(axis="z", pad=2, labelsize=9)
+    axis.set_title("3D Starting Positions and Underwater Goal")
+    axis.legend()
+    axis.set_xlim(*x_values)
+    axis.set_ylim(*y_values)
+    axis.set_zlim(0.0, max(0.2, outside_walls["z_max"]+0.02))
+    axis.set_box_aspect((
+        x_values[1]-x_values[0],
+        y_values[1]-y_values[0],
+        0.2,
+    ))
+    axis.view_init(elev=27, azim=-58)
+    if output_path:
+        figure.savefig(output_path, dpi=180, bbox_inches="tight")
+        plt.close(figure)
+    else:
+        plt.show()
     return
+
+
+def plot_rrt_paths_3d(paths, goal_position, outside_walls, wall, output_path=None):
+    """Plot several collision-free volumetric RRT paths."""
+    figure = plt.figure(figsize=(13, 8))
+    figure.subplots_adjust(left=0.05, right=0.88, bottom=0.14, top=0.90)
+    axis = figure.add_subplot(111, projection="3d")
+    colors = mpl.colormaps["tab10"](np.linspace(0, 1, len(paths)))
+    for index, (path, color) in enumerate(zip(paths, colors), start=1):
+        points = np.asarray(path)
+        axis.plot(
+            points[:, 0], points[:, 1], points[:, 2], color=color,
+            linewidth=2.2, label=f"Path {index}",
+        )
+        axis.scatter(*points[0], color=color, marker="o", s=28, depthshade=False)
+    axis.scatter(
+        *goal_position[:3], color="black", marker="x", s=38,
+        depthshade=False, label="Underwater goal",
+    )
+    axis.bar3d(
+        wall["x_min"], wall["y_min"], wall["z_min"],
+        wall["x_max"]-wall["x_min"], wall["y_max"]-wall["y_min"],
+        wall["z_max"]-wall["z_min"], color="grey", alpha=0.5,
+        shade=True, label="Obstacle",
+    )
+    x_values = [outside_walls["x_min"], outside_walls["x_max"]]
+    y_values = [outside_walls["y_min"], outside_walls["y_max"]]
+    z_values = [outside_walls.get("z_floor", 0.0), outside_walls["z_max"]]
+    corners = [(x, y, z) for x in x_values for y in y_values for z in z_values]
+    for corner_index, first in enumerate(corners):
+        for second in corners[corner_index+1:]:
+            if sum(a != b for a, b in zip(first, second)) == 1:
+                axis.plot(*zip(first, second), color="black", alpha=0.45)
+    axis.set_xlabel("X Position", labelpad=18)
+    axis.set_ylabel("Y Position", labelpad=18)
+    axis.set_zlabel("Z Position", labelpad=12)
+    axis.tick_params(axis="x", pad=2, labelsize=9)
+    axis.tick_params(axis="y", pad=2, labelsize=9)
+    axis.tick_params(axis="z", pad=2, labelsize=9)
+    axis.set_title("Example 3D RRT Paths", pad=18)
+    axis.set_xlim(*x_values)
+    axis.set_ylim(*y_values)
+    axis.set_zlim(0.0, 0.2)
+    axis.set_box_aspect((x_values[1]-x_values[0], y_values[1]-y_values[0], 0.2))
+    axis.view_init(elev=27, azim=-58)
+    axis.legend(loc="upper right", fontsize=9)
+    if output_path:
+        figure.savefig(output_path, dpi=180, bbox_inches="tight")
+        plt.close(figure)
+    else:
+        plt.show()
+
+
+def plot_turbulence(wall, output_path=None, simulation_steps=400):
+    """Plot 3D velocity arrows colored by local vorticity magnitude."""
+    from .fluid import FluidDynamics
+
+    fluid = FluidDynamics()
+    for _ in range(simulation_steps):
+        fluid.field.step(0.01, fluid.density)
+    vorticity = np.linalg.norm(fluid.field.vorticity(), axis=-1)
+    sample = np.zeros_like(vorticity, dtype=bool)
+    sample[::2, ::3, ::3] = True
+    sample &= ~fluid.field.solid
+    velocity = fluid.field.velocity[sample]
+    speed = np.linalg.norm(velocity, axis=1)
+    sample_indices = np.flatnonzero(sample)
+    keep = speed > np.percentile(speed, 15)
+    selected = sample_indices[keep]
+    mask = np.zeros_like(sample)
+    mask.flat[selected] = True
+    selected_vorticity = vorticity[mask]
+    normalization = mpl.colors.Normalize(
+        vmin=float(selected_vorticity.min()),
+        vmax=float(selected_vorticity.max()),
+    )
+    colors = mpl.colormaps["inferno"](normalization(selected_vorticity))
+
+    figure = plt.figure(figsize=(13, 8))
+    figure.subplots_adjust(left=0.04, right=0.72, bottom=0.12, top=0.90)
+    axis = figure.add_subplot(111, projection="3d")
+    axis.quiver(
+        fluid.field.x[mask], fluid.field.y[mask], fluid.field.z[mask],
+        fluid.field.velocity[..., 0][mask],
+        fluid.field.velocity[..., 1][mask],
+        fluid.field.velocity[..., 2][mask],
+        length=0.55, normalize=False, colors=colors,
+        linewidth=0.8, arrow_length_ratio=0.3,
+    )
+    axis.bar3d(
+        wall["x_min"], wall["y_min"], wall["z_min"],
+        wall["x_max"]-wall["x_min"], wall["y_max"]-wall["y_min"],
+        wall["z_max"]-wall["z_min"], color="grey", alpha=0.4,
+    )
+    color_map = mpl.cm.ScalarMappable(norm=normalization, cmap="inferno")
+    color_map.set_array([])
+    colorbar = figure.colorbar(
+        color_map, ax=axis, shrink=0.68, pad=0.18,
+        label="Vorticity magnitude (1/s)",
+    )
+    colorbar.ax.yaxis.labelpad = 12
+    axis.set_xlabel("X Position")
+    axis.set_ylabel("Y Position")
+    axis.set_zlabel("Z Position")
+    axis.xaxis.labelpad = 16
+    axis.yaxis.labelpad = 16
+    axis.zaxis.labelpad = 10
+    axis.tick_params(axis="x", pad=2, labelsize=9)
+    axis.tick_params(axis="y", pad=2, labelsize=9)
+    axis.tick_params(axis="z", pad=2, labelsize=9)
+    axis.set_title("3D Turbulent Velocity Field", pad=18)
+    axis.set_box_aspect((1.2, 0.64, 0.15))
+    axis.view_init(elev=24, azim=-58)
+    if output_path:
+        figure.savefig(output_path, dpi=180, bbox_inches="tight")
+        plt.close(figure)
+    else:
+        plt.show()
 
 def main():
     from .commands import parse_destination
@@ -1639,13 +1871,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
-    goal_position = np.array([0.8, 0.0, 0.15])
+    goal_position = np.array([0.9, -0.22, 0.06])
     destination_positions = {
         "start": np.array([0.0, 0.0, 0.15]),
         "goal": goal_position,
-        "underwater": np.array([0.9, -0.22, 0.06]),
+        "underwater": goal_position,
     }
-    epsilon = 0.1
+    epsilon = 0.015
 
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     environment_path = os.path.join(project_root, "env", "ball_square.xml")
@@ -1705,7 +1937,10 @@ def main():
             else:
                 destination = destination_positions[choice]
                 initial_state = current_state
-                print(f"Navigating to {choice} at {tuple(destination)}...")
+                print(
+                    f"Navigating to {choice} at "
+                    f"{format_position(destination)}..."
+                )
             _, current_state = render_trained_policy(
                 model=model,
                 goal_position=destination,
@@ -1723,7 +1958,7 @@ def main():
 
         elif command.lower() == "train":
             print("Training the network...")
-            num_training_episodes = 360
+            num_training_episodes = 1200
             model = ppo_training(
                 model=model,
                 goal_position=goal_position,
@@ -1734,7 +1969,9 @@ def main():
                 mujoco_model=mujoco_model,
                 max_steps=1800,
                 gamma=0.99,
-                plot=True,
+                plot_directory=os.path.join(
+                    project_root, "report", "images", "fluid"
+                ),
                 epsilon=epsilon,
                 checkpoint_path=checkpoint_path,
                 device=device  # pass device here

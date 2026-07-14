@@ -15,6 +15,12 @@ PATH_CLEARANCE = 0.06
 POSITION_DIMENSIONS = 3
 MOTOR_FORCE_SCALE = np.array([15.0, 15.0, 80.0])
 CONTROL_TIMESTEP = 0.02
+DEFAULT_CAMERA_VIEW = {
+    "azimuth": 0.0,
+    "elevation": -90.0,
+    "distance": 2.0,
+    "lookat": np.array([0.5, 0.0, 0.0], dtype=np.float64),
+}
 
 
 def format_position(position, decimals=3):
@@ -134,6 +140,21 @@ class ActorCriticModel(nn.Module):
         value = self.critic(state)
         return mu, sigma, value
 
+
+def apply_camera_view(camera, view):
+    camera.azimuth = float(view["azimuth"])
+    camera.elevation = float(view["elevation"])
+    camera.distance = float(view["distance"])
+    camera.lookat = np.asarray(view["lookat"], dtype=np.float64).copy()
+
+
+def remember_camera_view(camera):
+    DEFAULT_CAMERA_VIEW["azimuth"] = float(camera.azimuth)
+    DEFAULT_CAMERA_VIEW["elevation"] = float(camera.elevation)
+    DEFAULT_CAMERA_VIEW["distance"] = float(camera.distance)
+    DEFAULT_CAMERA_VIEW["lookat"] = np.asarray(camera.lookat).copy()
+
+
 def init_mujoco_render(model):
     if not glfw.init():
         raise Exception("Could not initialize GLFW")
@@ -150,11 +171,7 @@ def init_mujoco_render(model):
     viewport = mujoco.MjrRect(0, 0, 800, 600)
     option = mujoco.MjvOption()
 
-    # Adjust camera view
-    camera.azimuth = 0
-    camera.elevation = -90
-    camera.distance = 2.0
-    camera.lookat = np.array([0.5, 0.0, 0.0])
+    apply_camera_view(camera, DEFAULT_CAMERA_VIEW)
 
     mouse = {
         "left": False,
@@ -201,6 +218,7 @@ def init_mujoco_render(model):
             scene,
             camera,
         )
+        remember_camera_view(camera)
 
     def scroll_callback(window, x_offset, y_offset):
         mujoco.mjv_moveCamera(
@@ -211,6 +229,7 @@ def init_mujoco_render(model):
             scene,
             camera,
         )
+        remember_camera_view(camera)
 
     glfw.set_mouse_button_callback(window, mouse_button_callback)
     glfw.set_cursor_pos_callback(window, cursor_position_callback)
@@ -245,6 +264,7 @@ def render_trained_policy(
     control_timestep = float(mujoco_model.opt.timestep)
     physics_substeps = max(1, int(round(control_timestep / 0.01)))
     mujoco_model.opt.timestep = control_timestep / physics_substeps
+    navigation_clearance = spawn_margin
     if initial_state is not None:
         state = np.asarray(initial_state, dtype=np.float64).copy()
     elif fixed_start:
@@ -264,7 +284,8 @@ def render_trained_policy(
         navigation_goal = np.append(navigation_goal, outside_walls["z_max"])
     start_position = mujoco_data.xpos[ball_body_id, :3].copy()
     path = plan_navigation_path(
-        start_position, navigation_goal, walls, outside_walls
+        start_position, navigation_goal, walls, outside_walls,
+        clearance=navigation_clearance,
     )
     paths = [path if path is not None else [start_position, navigation_goal]]
     waypoint_indices = np.ones(1, dtype=np.int32)
@@ -295,26 +316,29 @@ def render_trained_policy(
         candidate = np.asarray(goal, dtype=np.float64).copy()
         candidate[0] = np.clip(
             candidate[0],
-            outside_walls["x_min"] + PATH_CLEARANCE,
-            outside_walls["x_max"] - PATH_CLEARANCE,
+            outside_walls["x_min"] + navigation_clearance,
+            outside_walls["x_max"] - navigation_clearance,
         )
         candidate[1] = np.clip(
             candidate[1],
-            outside_walls["y_min"] + PATH_CLEARANCE,
-            outside_walls["y_max"] - PATH_CLEARANCE,
+            outside_walls["y_min"] + navigation_clearance,
+            outside_walls["y_max"] - navigation_clearance,
         )
         candidate[2] = np.clip(
             candidate[2],
             outside_walls["z_min"],
             outside_walls["z_max"],
         )
-        if not path_point_is_free(candidate, walls, outside_walls):
+        if not path_point_is_free(
+            candidate, walls, outside_walls, clearance=navigation_clearance
+        ):
             if announce:
                 print(f"\nGoal move blocked at {format_position(candidate)}.")
             return False
         physical_position = mujoco_data.xpos[ball_body_id, :3].copy()
         new_path = plan_navigation_path(
-            physical_position, candidate, walls, outside_walls
+            physical_position, candidate, walls, outside_walls,
+            clearance=navigation_clearance,
         )
         if new_path is None:
             if announce:
@@ -695,9 +719,13 @@ def plan_rrt_path(
     return None
 
 
-def plan_navigation_path(start, goal, walls, outside_walls):
+def plan_navigation_path(
+    start, goal, walls, outside_walls, clearance=PATH_CLEARANCE
+):
     """Plan an unrestricted volumetric route through the water."""
-    return plan_rrt_path(start, goal, walls, outside_walls)
+    return plan_rrt_path(
+        start, goal, walls, outside_walls, clearance=clearance
+    )
 
 def create_episode_paths(
     states, goal_position, walls, outside_walls,

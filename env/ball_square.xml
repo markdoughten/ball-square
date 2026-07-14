@@ -2,7 +2,8 @@
   <option timestep="0.01" integrator="RK4" />
   <worldbody>
     <light pos="0 0 1.5" dir="0 0 -1" directional="true" />
-    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" friction=".5 0.005 0.001"
+    <geom name="floor" type="box" pos="0.45 0 -0.005" size="0.67 0.32 0.005"
+      material="hazy_floor" friction=".5 0.005 0.001"
       priority="2" condim="4" />
   </worldbody>
 
@@ -24,17 +25,17 @@
     </body>
 
     <body name="case" pos="0 0 0.1">
-      <geom name="gcase_a" type="box" size="0.05 0.32 0.1" pos="-.2 0 0" />
-      <geom name="gcase_b" type="box" size="0.05 0.32 0.1" pos="1.1 0 0" />
-      <geom name="gcase_c" type="box" size="0.7 0.04 0.1" pos="0.45 .36 0" />
-      <geom name="gcase_d" type="box" size="0.7 0.04 0.1" pos="0.45 -.36 0" />
+      <geom name="gcase_a" type="box" size="0.05 0.32 0.1" pos="-.2 0 0" material="static" />
+      <geom name="gcase_b" type="box" size="0.05 0.32 0.1" pos="1.1 0 0" material="static" />
+      <geom name="gcase_c" type="box" size="0.7 0.04 0.1" pos="0.45 .36 0" material="static" />
+      <geom name="gcase_d" type="box" size="0.7 0.04 0.1" pos="0.45 -.36 0" material="static" />
     </body>
     
     <!-- Translucent tank volume; forces are supplied by lib/fluid.py. -->
     <body name="water" pos="0.45 0 0.075">
       <!-- Filled from the floor to z=0.15: above wall_3, below the case walls. -->
       <geom name="water_surface" type="box" size="0.67 0.32 0.075"
-        rgba="0.2 0.5 0.8 0.3" contype="0" conaffinity="0" />
+        rgba="0.58 0.72 0.82 0.22" contype="0" conaffinity="0" />
     </body>
     <site name="underwater_target" type="sphere" pos="0.9 -0.22 0.06"
       size="0.01" rgba="0.1 1 1 0.55" />
@@ -52,7 +53,8 @@
     <!-- Materials for visualization -->
     <material name="MatPlane" rgba="0.8 0.9 0.8 1" />
     <material name="movable" rgba="0.94 1.0 0.0 1" />
-    <material name="static" rgba="0.8 0.2 0.2 1" />
+    <material name="static" rgba="0.55 0.55 0.55 1" />
+    <material name="hazy_floor" rgba="0.55 0.55 0.55 0.55" />
     <material name="BallMat" rgba="0.2 0.2 0.8 1" />
 
     <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072" />

@@ -20,20 +20,21 @@ rewards, a small motor-energy penalty, and an emergency velocity-braking shield.
 ## Run
 
 ```powershell
-cd src
-..\.venv\Scripts\python.exe app.py
+.\.venv\Scripts\python.exe src/app.py
 ```
 
-At the command prompt, type a natural-language instruction containing `goal` or
-`start` (for example, `go to the goal` or `return home`). The robot preserves its
-position between commands and plans a path to the single underwater goal
-`(0.9, -0.22, 0.06)` or start `(0, 0, 0.15)`. There is no surface goal. While
-the simulation window is running, type `start` or `goal` in the
-terminal and press Enter to redirect the robot immediately from its current
-position. The `underwater` command sends it to `(0.9, -0.22, 0.06)` inside the
-translucent blue tank, where density, viscosity, current, pressure drag, partial
-submersion, and added-mass forces are applied. Type `quit` to close the simulation. Other main-menu commands are
-`train`, `random`, and `quit`.
+At the command prompt, choose a numbered menu option: navigate to the surface
+start, navigate to the underwater goal, start a random trial, train the PPO
+model, or quit. The robot preserves its position between navigation commands
+and plans a path to the single underwater goal `(0.9, -0.22, 0.06)` or start
+`(0, 0, 0.15)`. There is no surface goal. While the simulation window is
+running, type `1` to redirect to start, `2` to redirect to the underwater goal,
+or `5` to quit. With the simulation window focused, hold W/S to move the
+active goal along the long side, A/D to move side to side, and arrow Up/Down to
+change its depth. Completed runs
+return to the main menu. The underwater goal is inside the translucent blue
+tank, where density, viscosity, current, pressure drag, partial submersion, and
+added-mass forces are applied.
 The tank is filled from the floor to `z = 0.15`, above the central obstacle
 (`z = 0.10`) and below the outer wall tops (`z = 0.20`).
 The water velocity and pressure evolve through a 3D incompressible
@@ -47,9 +48,7 @@ Two-way immersed-boundary coupling makes the ball enforce a moving no-slip
 boundary and returns the equal-and-opposite drag/added-mass impulse to nearby
 fluid cells, producing a wake. Fixed walls and the center obstacle exchange
 momentum through their no-slip constraints.
-With the simulation window focused, use the arrow keys to change the current
-direction. The inlet turns gradually at 60 degrees per second while preserving
-flow speed, and the Navier–Stokes field evolves continuously.
+The inlet current remains active while the fluid field evolves continuously.
 Time-varying divergence-free eddies and vorticity confinement add turbulence.
 Buoyancy is calibrated so the robot rises when fully submerged and settles at
 the water surface with half its spherical volume submerged; vertical drag

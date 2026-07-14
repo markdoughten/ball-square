@@ -281,34 +281,81 @@ def render_trained_policy(
     }
     from .fluid import FluidDynamics
     fluid = FluidDynamics()
-    current_directions = {
-        glfw.KEY_LEFT: np.array([-1.0, 0.0]),
-        glfw.KEY_RIGHT: np.array([1.0, 0.0]),
-        glfw.KEY_UP: np.array([0.0, 1.0]),
-        glfw.KEY_DOWN: np.array([0.0, -1.0]),
+    target_site_id = mujoco.mj_name2id(
+        mujoco_model, mujoco.mjtObj.mjOBJ_SITE, "underwater_target"
+    )
+    if target_site_id >= 0:
+        mujoco_model.site_pos[target_site_id] = active_goal
+        mujoco.mj_forward(mujoco_model, mujoco_data)
+
+    last_goal_move_report = 0.0
+
+    def set_active_goal(goal, label="goal", announce=True):
+        nonlocal active_goal, paths, reached_goal, last_goal_move_report
+        candidate = np.asarray(goal, dtype=np.float64).copy()
+        candidate[0] = np.clip(
+            candidate[0],
+            outside_walls["x_min"] + PATH_CLEARANCE,
+            outside_walls["x_max"] - PATH_CLEARANCE,
+        )
+        candidate[1] = np.clip(
+            candidate[1],
+            outside_walls["y_min"] + PATH_CLEARANCE,
+            outside_walls["y_max"] - PATH_CLEARANCE,
+        )
+        candidate[2] = np.clip(
+            candidate[2],
+            outside_walls["z_min"],
+            outside_walls["z_max"],
+        )
+        if not path_point_is_free(candidate, walls, outside_walls):
+            if announce:
+                print(f"\nGoal move blocked at {format_position(candidate)}.")
+            return False
+        physical_position = mujoco_data.xpos[ball_body_id, :3].copy()
+        new_path = plan_navigation_path(
+            physical_position, candidate, walls, outside_walls
+        )
+        if new_path is None:
+            if announce:
+                print(f"\nNo route to {format_position(candidate)}.")
+            return False
+        active_goal = candidate
+        paths = [new_path]
+        waypoint_indices[:] = 1
+        reached_goal = False
+        if target_site_id >= 0:
+            mujoco_model.site_pos[target_site_id] = active_goal
+            mujoco.mj_forward(mujoco_model, mujoco_data)
+        if announce:
+            print(
+                f"\n{label} set to {format_position(active_goal)} "
+                f"({len(paths[0])} waypoints)."
+            )
+            last_goal_move_report = step if "step" in locals() else 0.0
+        return True
+
+    goal_key_directions = {
+        glfw.KEY_W: np.array([1.0, 0.0, 0.0]),
+        glfw.KEY_S: np.array([-1.0, 0.0, 0.0]),
+        glfw.KEY_A: np.array([0.0, 1.0, 0.0]),
+        glfw.KEY_D: np.array([0.0, -1.0, 0.0]),
+        glfw.KEY_UP: np.array([0.0, 0.0, 1.0]),
+        glfw.KEY_DOWN: np.array([0.0, 0.0, -1.0]),
     }
-
-    def fluid_key_callback(window, key, scancode, action, mods):
-        if action not in {glfw.PRESS, glfw.REPEAT} or key not in current_directions:
-            return
-        fluid.set_current_direction(current_directions[key])
-        direction_name = {
-            glfw.KEY_LEFT: "left", glfw.KEY_RIGHT: "right",
-            glfw.KEY_UP: "up", glfw.KEY_DOWN: "down",
-        }[key]
-        print(f"\nFluid current turning toward {direction_name}.")
-        if interactive:
-            print("Command: ", end="", flush=True)
-
-    glfw.set_key_callback(window, fluid_key_callback)
     ball_geom_id = mujoco.mj_name2id(
         mujoco_model, mujoco.mjtObj.mjOBJ_GEOM, "gball_0"
     )
     ball_radius = float(mujoco_model.geom_size[ball_geom_id, 0])
     if interactive:
         from .commands import parse_destination, poll_console_line
-        print("Simulation controls: 'start', 'goal', 'underwater', or 'quit'.")
-        print("Use the arrow keys in the simulation window to steer the current.")
+        simulation_options = {
+            "1": "start",
+            "2": "underwater",
+            "5": "quit",
+        }
+        print("Simulation controls: 1=start, 2=underwater goal, 5=quit.")
+        print("Hold W/S along the long side, A/D side to side; arrow Up/Down change depth.")
         print("Command: ", end="", flush=True)
     model.eval()
     with torch.no_grad():
@@ -318,37 +365,42 @@ def render_trained_policy(
                 break
             step += 1
             if interactive:
+                goal_direction = np.zeros(3, dtype=np.float64)
+                for key, direction in goal_key_directions.items():
+                    if glfw.get_key(window, key) == glfw.PRESS:
+                        goal_direction += direction
+                if np.any(goal_direction):
+                    goal_direction /= np.linalg.norm(goal_direction)
+                    moved = set_active_goal(
+                        active_goal + goal_direction * 0.18 * control_timestep,
+                        "Goal",
+                        announce=False,
+                    )
+                    if moved and step - last_goal_move_report >= 30:
+                        print(f"\nGoal at {format_position(active_goal)}.")
+                        print("Command: ", end="", flush=True)
+                        last_goal_move_report = step
+            if interactive:
                 command = poll_console_line()
                 if command is not None:
                     normalized_command = command.lower()
-                    if normalized_command in {"quit", "exit"}:
+                    selected_command = simulation_options.get(command)
+                    if selected_command == "quit" or normalized_command in {"quit", "exit"}:
                         break
-                    destination = parse_destination(command)
+                    destination = (
+                        selected_command
+                        if selected_command in destination_positions
+                        else parse_destination(command)
+                    )
                     if destination is None:
-                        print("Unknown command; use 'start', 'goal', 'underwater', or 'quit'.")
+                        print("Unknown command; use 1=start, 2=underwater goal, or 5=quit.")
                     else:
-                        active_goal = np.asarray(
+                        new_goal = np.asarray(
                             destination_positions[destination], dtype=np.float64
                         )
-                        if len(active_goal) == 2:
-                            active_goal = np.append(
-                                active_goal, outside_walls["z_max"]
-                            )
-                        physical_position = mujoco_data.xpos[ball_body_id, :3].copy()
-                        new_path = plan_navigation_path(
-                            physical_position, active_goal, walls, outside_walls
-                        )
-                        paths = [
-                            new_path if new_path is not None
-                            else [physical_position, active_goal]
-                        ]
-                        waypoint_indices[:] = 1
-                        reached_goal = False
-                        print(
-                            f"Redirecting to {destination} at "
-                            f"{format_position(active_goal)} "
-                            f"({len(paths[0])} waypoints)."
-                        )
+                        if len(new_goal) == 2:
+                            new_goal = np.append(new_goal, outside_walls["z_max"])
+                        set_active_goal(new_goal, f"Redirecting to {destination}")
                     print("Command: ", end="", flush=True)
             physical_state = simulation_state(
                 mujoco_model, mujoco_data, ball_body_id
@@ -398,7 +450,7 @@ def render_trained_policy(
                     f"distance {goal_distance:.4f}."
                 )
                 if interactive:
-                    print("Command: ", end="", flush=True)
+                    break
                 else:
                     break
     model.train()
@@ -1967,16 +2019,31 @@ def main():
     current_state = np.array([0.0, 0.0, 0.15, 0.0, 0.0, 0.0])
     checkpoint_loaded = False
 
+    menu_options = {
+        "1": ("start", "Navigate to surface start"),
+        "2": ("underwater", "Navigate to underwater goal"),
+        "3": ("random", "Random start to underwater goal"),
+        "4": ("train", "Train PPO model"),
+        "5": ("quit", "Quit"),
+    }
+
     while True:
         print("\nMenu:")
-        print("Tell the robot to go to 'goal', 'start', or 'underwater'")
-        print("Other commands: train, random, quit")
+        for number, (_, label) in menu_options.items():
+            print(f"  {number}. {label}")
 
-        command = input("Command: ").strip()
-        choice = parse_destination(command)
+        command = input("Select option: ").strip()
+        selected_action = menu_options.get(command, (None, None))[0]
+        choice = (
+            selected_action
+            if selected_action in destination_positions
+            else parse_destination(command)
+        )
 
-        if choice is not None or command.lower() == "random":
-            if os.path.exists(checkpoint_path) and not checkpoint_loaded:
+        if choice is not None or selected_action == "random":
+            if checkpoint_loaded:
+                pass
+            elif os.path.exists(checkpoint_path):
                 checkpoint = torch.load(
                     checkpoint_path, map_location=device, weights_only=False
                 )
@@ -1985,7 +2052,7 @@ def main():
                 except RuntimeError:
                     print(
                         "The saved checkpoint uses the old observation layout. "
-                        "Run option 2 to train the wall-aware PPO model first."
+                        "Run option 4 to train the wall-aware PPO model first."
                     )
                     continue
                 checkpoint_loaded = True
@@ -1998,7 +2065,7 @@ def main():
                 print(
                     "No PPO checkpoint found; rendering the current in-memory model."
                 )
-            if command.lower() == "random":
+            if selected_action == "random":
                 destination = goal_position
                 initial_state = None
                 print("Starting randomly and navigating to the goal...")
@@ -2024,7 +2091,7 @@ def main():
                 device=device,
             )
 
-        elif command.lower() == "train":
+        elif selected_action == "train":
             print("Training the network...")
             num_training_episodes = 1200
             model = ppo_training(
@@ -2045,8 +2112,8 @@ def main():
                 device=device  # pass device here
             )
 
-        elif command.lower() in {"quit", "exit"}:
+        elif selected_action == "quit" or command.lower() in {"quit", "exit"}:
             print("Goodbye!")
             break
         else:
-            print("I couldn't identify a destination. Say 'start', 'goal', or 'underwater'.")
+            print("Choose 1, 2, 3, 4, or 5.")

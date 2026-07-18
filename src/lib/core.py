@@ -2014,6 +2014,13 @@ def plot_turbulence(wall, output_path=None, simulation_steps=400):
 
 def main():
     from .commands import parse_destination
+    from .ecosystem import (
+        EcosystemConfig,
+        plot_energy_groups,
+        plot_aggregate_energy_rankings,
+        run_repeated_ecosystem_simulations,
+        show_ecosystem_mujoco_window,
+    )
     
     # Select device: GPU if available, otherwise CPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -2052,7 +2059,9 @@ def main():
         "2": ("underwater", "Navigate to underwater goal"),
         "3": ("random", "Random start to underwater goal"),
         "4": ("train", "Train PPO model"),
-        "5": ("quit", "Quit"),
+        "5": ("ecosystem_window", "View ecosystem for fixed window"),
+        "6": ("ecosystem_long", "Run long ecosystem simulation"),
+        "7": ("quit", "Quit"),
     }
 
     while True:
@@ -2140,8 +2149,149 @@ def main():
                 device=device  # pass device here
             )
 
+        elif selected_action == "ecosystem_window":
+            raw_steps = input("Window steps [1000]: ").strip()
+            window_steps = int(raw_steps) if raw_steps else 1000
+            print(
+                "Opening MuJoCo/Navier-Stokes ecosystem tank. Green spheres "
+                "are food; creature color shows aggression and alpha shows energy."
+            )
+            show_ecosystem_mujoco_window(
+                steps=window_steps,
+                seed=1,
+                config=EcosystemConfig(
+                    initial_creatures=2,
+                    initial_energy_range=(125.0, 145.0),
+                    start_nearby_pair=True,
+                    food_count=24,
+                    max_population=40,
+                    dt=CONTROL_TIMESTEP,
+                    metabolism_rate=0.0025,
+                    movement_cost=0.00008,
+                    reproduction_threshold=95.0,
+                    child_energy=35.0,
+                    mate_energy_cost=18.0,
+                    shape_mutation_rate=0.18,
+                    reward_guided_mutation=True,
+                    mutation_candidates=8,
+                    guided_behavior=True,
+                    guidance_strength=0.9,
+                    fixed_creature_radius=0.02,
+                    food_radius=0.01,
+                    food_energy=45.0,
+                    predation_efficiency=0.22,
+                    attack_threshold=0.65,
+                    predation_enabled=True,
+                    predator_aggression_threshold=0.76,
+                    predator_hunger_threshold=0.85,
+                    require_mate_for_reproduction=True,
+                    mating_distance=0.12,
+                    old_age_start=7000,
+                    old_age_metabolism_rate=0.004,
+                    max_age=12000,
+                    use_navier_stokes=True,
+                ),
+            )
+
+        elif selected_action == "ecosystem_long":
+            raw_steps = input("Long simulation steps [10000]: ").strip()
+            simulation_steps = int(raw_steps) if raw_steps else 10000
+            raw_interval = input("Report interval [500]: ").strip()
+            report_interval = int(raw_interval) if raw_interval else 500
+            raw_seed_count = input("Repeated seeds [5]: ").strip()
+            seed_count = int(raw_seed_count) if raw_seed_count else 5
+            raw_workers = input("Parallel workers [auto]: ").strip()
+            worker_count = int(raw_workers) if raw_workers else None
+            ecosystem_config = EcosystemConfig(
+                initial_creatures=2,
+                initial_energy_range=(125.0, 145.0),
+                start_nearby_pair=True,
+                food_count=24,
+                max_population=40,
+                dt=CONTROL_TIMESTEP,
+                metabolism_rate=0.0025,
+                movement_cost=0.00008,
+                reproduction_threshold=95.0,
+                child_energy=35.0,
+                mate_energy_cost=18.0,
+                shape_mutation_rate=0.18,
+                reward_guided_mutation=True,
+                mutation_candidates=8,
+                guided_behavior=True,
+                guidance_strength=0.9,
+                fixed_creature_radius=0.02,
+                food_radius=0.01,
+                food_energy=45.0,
+                predation_efficiency=0.22,
+                attack_threshold=0.65,
+                predation_enabled=True,
+                predator_aggression_threshold=0.76,
+                predator_hunger_threshold=0.85,
+                require_mate_for_reproduction=True,
+                mating_distance=0.12,
+                old_age_start=7000,
+                old_age_metabolism_rate=0.004,
+                max_age=12000,
+                device=str(device),
+            )
+            print(
+                f"Running headless ecosystem simulation on {device} "
+                f"with {worker_count or 'auto'} workers..."
+            )
+
+            def report_seed_progress(completed, total, result, elapsed):
+                print(
+                    f"Completed seed {result['seed']} "
+                    f"({completed}/{total}) in {elapsed:.1f}s; "
+                    f"population={result['final_summary']['population']}, "
+                    f"births={result['final_summary']['births_total']}, "
+                    f"deaths={result['final_summary']['deaths_total']}, "
+                    f"food_eaten={result['final_summary']['food_eaten']}"
+                )
+
+            results, aggregate_groups = run_repeated_ecosystem_simulations(
+                steps=simulation_steps,
+                seeds=range(1, seed_count + 1),
+                config=ecosystem_config,
+                report_interval=report_interval,
+                max_workers=worker_count,
+                progress_callback=report_seed_progress,
+            )
+            for result in results:
+                print(
+                    f"Seed {result['seed']} final summary:",
+                    result["final_summary"],
+                )
+            ecosystem_plot_directory = os.path.join(
+                project_root, "report", "images", "ecosystem"
+            )
+            os.makedirs(ecosystem_plot_directory, exist_ok=True)
+            energy_plot_path = os.path.join(
+                ecosystem_plot_directory, "energy_by_shape_orientation.png"
+            )
+            if results:
+                plot_energy_groups(
+                    results[-1]["energy_groups"],
+                    output_path=energy_plot_path,
+                )
+            print(f"Saved energy plot to {energy_plot_path}")
+            aggregate_plot_path = os.path.join(
+                ecosystem_plot_directory,
+                "aggregate_energy_ranking.png",
+            )
+            ranked = plot_aggregate_energy_rankings(
+                aggregate_groups, aggregate_plot_path
+            )
+            print(f"Saved aggregate ranking plot to {aggregate_plot_path}")
+            print("Aggregate shape/orientation ranking:")
+            for rank, ((shape, orientation), values) in enumerate(ranked, start=1):
+                print(
+                    f"  {rank}. {shape} {orientation}: "
+                    f"mean_energy={np.mean(values):.2f}, n={len(values)}"
+                )
+
         elif selected_action == "quit" or command.lower() in {"quit", "exit"}:
             print("Goodbye!")
             break
         else:
-            print("Choose 1, 2, 3, 4, or 5.")
+            print("Choose 1, 2, 3, 4, 5, 6, or 7.")

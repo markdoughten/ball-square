@@ -61,6 +61,22 @@ class FluidDynamicsTests(unittest.TestCase):
         field.add_reaction_force(position, 0.04, [-1.0, 0.0, 0.0], 0.01, 997.0)
         self.assertGreater(np.linalg.norm(field.velocity-before), 0.0)
 
+    def test_multiple_moving_spheres_rasterize_into_fluid(self):
+        field = NavierStokesField(
+            FluidRegion(), [0.0, 0.0, 0.0], nx=24, ny=16, nz=10
+        )
+        field.set_moving_spheres(
+            [np.array([0.2, -0.1, 0.08]), np.array([0.8, 0.1, 0.08])],
+            [0.04, 0.04],
+            [np.array([0.1, 0.0, 0.0]), np.array([-0.1, 0.0, 0.0])],
+        )
+        field._apply_boundaries(field.velocity)
+
+        self.assertTrue(np.any(field.moving_solid))
+        moving_velocities = field.velocity[field.moving_solid]
+        self.assertTrue(np.any(np.isclose(moving_velocities[:, 0], 0.1)))
+        self.assertTrue(np.any(np.isclose(moving_velocities[:, 0], -0.1)))
+
     def test_turbulence_changes_flow_field(self):
         turbulent = NavierStokesField(
             FluidRegion(), [-0.025, 0.0], nx=20, ny=12

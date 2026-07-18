@@ -61,6 +61,7 @@ class NavierStokesField:
                       & (self.z <= 0.10))
         self.moving_solid = np.zeros_like(self.solid)
         self.moving_velocity = np.zeros(3, dtype=np.float64)
+        self.moving_velocity_field = np.zeros_like(self.velocity)
         self._apply_boundaries(self.velocity)
 
     @property
@@ -74,6 +75,31 @@ class NavierStokesField:
                             + (self.z-position[2])**2)
         self.moving_solid = (distance_squared <= radius**2) & ~self.solid
         self.moving_velocity = np.asarray(velocity, dtype=np.float64).copy()
+        self.moving_velocity_field[:] = 0.0
+        self.moving_velocity_field[self.moving_solid] = self.moving_velocity
+
+    def set_moving_spheres(self, positions, radii, velocities):
+        """Rasterize multiple moving no-slip spheres into the fluid grid."""
+        self.moving_solid[:] = False
+        self.moving_velocity_field[:] = 0.0
+        for position, radius, velocity in zip(positions, radii, velocities):
+            position = np.asarray(position, dtype=np.float64)
+            distance_squared = (
+                (self.x-position[0])**2
+                + (self.y-position[1])**2
+                + (self.z-position[2])**2
+            )
+            sphere = (distance_squared <= float(radius)**2) & ~self.solid
+            self.moving_solid |= sphere
+            self.moving_velocity_field[sphere] = np.asarray(
+                velocity, dtype=np.float64
+            )
+        if np.any(self.moving_solid):
+            self.moving_velocity = np.mean(
+                self.moving_velocity_field[self.moving_solid], axis=0
+            )
+        else:
+            self.moving_velocity[:] = 0.0
 
     def _sample(self, values, x, y, z):
         gx = np.clip((x-self.region.x_min)/self.dx, 0, self.nx-1)
@@ -113,7 +139,9 @@ class NavierStokesField:
         velocity[0] = 0.0
         velocity[-1, ..., 2] = 0.0
         velocity[self.solid] = 0.0
-        velocity[self.moving_solid] = self.moving_velocity
+        velocity[self.moving_solid] = self.moving_velocity_field[
+            self.moving_solid
+        ]
 
     def vorticity(self, velocity=None):
         velocity = self.velocity if velocity is None else velocity

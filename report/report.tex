@@ -727,4 +727,186 @@ multiple random seeds, compare the full solver with laminar and one-way-coupled
 ablations, and reduce expert authority gradually to measure the learned policy's
 independent contribution.
 
+\clearpage
+\part{Evolutionary Ecosystem Extension}
+
+\section{Motivation and Scope}
+
+The latest extension turns the tank from a single-robot navigation benchmark
+into a small artificial-life ecosystem.  Instead of one controlled ball moving
+to a fixed target, the tank contains multiple creatures and food resources.
+Creatures have mutable neural controllers, mutable morphology, energy, age,
+predation behavior, and mate-based reproduction.  This extension is exposed
+through two application modes: option 5 renders the ecosystem in the MuJoCo tank
+for a fixed number of visible steps, while option 6 runs the same ecosystem
+rules headlessly for longer experiments and writes summary plots.
+
+The ecosystem uses the same tank appearance as the navigation demo.  The floor,
+case walls, central obstacle, translucent water volume, skybox, haze, lighting,
+and mouse camera controls match the earlier MuJoCo renderer.  Creatures have
+the same initial radius as the original ball, \(0.02\,\mathrm{m}\), and food
+uses the same radius as the underwater goal marker, \(0.01\,\mathrm{m}\).
+
+\section{Creature State and Energy Model}
+
+Each creature stores its position, velocity, energy, age, morphology genome,
+and neural controller.  The controller observes local motion and nearby
+resources and produces three thrust components plus an attack intent.  Motion
+is evaluated in the fluid volume with water current, drag, mass, motor force,
+and boundary handling.  The ecosystem prevents both creatures and food from
+spawning inside the central obstacle, and creatures that enter the obstacle are
+projected back out with an energy penalty and a bounce impulse.
+
+Energy is the central survival variable:
+\[
+E_{t+1}=E_t+E_{\mathrm{food}}+E_{\mathrm{prey}}
+-E_{\mathrm{metabolism}}-E_{\mathrm{motion}}-E_{\mathrm{age}}.
+\]
+Food increases energy, motor effort decreases it, and old age introduces an
+additional metabolic penalty after a configured age threshold.  A creature dies
+from starvation when energy reaches zero, from old age when it exceeds its
+maximum age, or from predation when successfully eaten by another creature.
+The simulation reports these causes separately as starvation, old-age, and
+predation deaths.
+
+\section{Guided Behavior}
+
+Purely random neural controllers tended to drift into walls or fail to find
+food and mates.  To make the ecosystem resemble the waypoint-following behavior
+of option 1, option 5 and option 6 blend the mutable neural controller with a
+guided steering term.  Hungry creatures steer toward the nearest food.  Creatures
+above the reproduction energy threshold steer toward the nearest eligible mate.
+Hungry, sufficiently aggressive creatures may instead steer toward weaker prey
+and set their attack intent.  A wall and obstacle avoidance term pushes the
+creature away from tank boundaries and the central block.
+
+The neural controller is still present and still mutates, but the guidance term
+keeps early generations from collapsing before selection has useful behavior to
+act on.  In the current interactive preset, guidance contributes 90\% of the
+action and the neural controller contributes the remaining 10\%.
+
+\section{Reproduction and Mutation}
+
+Reproduction now requires two nearby eligible creatures rather than a single
+creature cloning itself.  Both parents must exceed the reproduction energy
+threshold and must be within the mating distance.  When reproduction occurs,
+both parents pay a mating energy cost and a child is spawned near the midpoint
+between them.
+
+The child controller is produced by crossover between the two parent neural
+networks followed by parameter mutation.  The child morphology is produced by
+averaging parent traits and then applying mutation.  Shape mutation is
+reward-guided rather than accepting a purely random mutation.  For each birth,
+the simulator creates multiple morphology candidates, including explicit sphere,
+ellipsoid, and capsule alternatives.  These candidates are scored by a
+morphology reward that favors efficient thrust-to-mass ratio, lower drag area,
+useful sensor range, defense, and balanced aggression.  The highest-scoring
+candidate becomes the child.
+
+The bounding radius remains fixed at \(0.02\,\mathrm{m}\), so mutation changes
+the body's proportions and type rather than simply making larger creatures.
+Rendered creatures can therefore appear as spheres, ellipsoids, or capsules.
+Each mutated body also stores a random orientation quaternion, and MuJoCo uses
+that orientation when drawing the shape.
+
+The hydrodynamic drag model now depends on this shape and orientation.  Spheres
+use an orientation-invariant projected area and drag coefficient.  Ellipsoids
+use the projected area of the rotated ellipsoid along the local flow direction,
+so broadside orientations experience higher drag than streamlined orientations.
+Capsules interpolate between a low-drag nose-first area and a higher-drag
+side-on area.  This makes the energy ranking sensitive to the actual evolved
+shape-orientation combination rather than treating all creatures as equivalent
+spheres in the fluid.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{images/ecosystem/shape_table.png}
+    \caption{Reference table for the three rendered morphology classes used by
+    the ecosystem.  All shapes keep the same maximum bounding radius as the
+    original ball while allowing the proportions and orientation to evolve.
+    Columns show representative orientation buckets; the black arrow indicates
+    the creature's local forward axis used for orientation grouping.}
+    \label{fig:ecosystem_shape_table}
+\end{figure}
+
+\section{Predators and Old Age}
+
+Predation is enabled but gated to avoid immediate population collapse.  A
+creature only hunts when its aggression exceeds the predator threshold and its
+energy is below a hunger threshold.  The attack must also exceed the attack
+intent threshold and the prey must be within biting range.  A successful predator
+receives a fraction of the prey's energy, while the prey is removed from the
+population.
+
+Old age adds a second long-term population pressure.  After an old-age start
+threshold, creatures pay an increasing age-related energy cost.  At the maximum
+age, they are removed and counted as old-age deaths.  This prevents very
+successful early creatures from occupying the population indefinitely and gives
+new mutations a chance to enter the ecosystem.
+
+\section{Long-Run Output}
+
+Option 6 runs the same ecosystem rules as option 5 without opening a MuJoCo
+window.  It repeats the long simulation across multiple random seeds and can
+execute those seeds in parallel worker processes.  The default worker selection
+is automatic and caps at six workers.  As each seed finishes, the command prints
+progress with the completed seed count, elapsed time, final population, births,
+deaths, and food eaten.  It then prints each seed's final summary, including
+population, capacity, food count, generation, step births, total births,
+capacity-blocked births, deaths, old-age deaths, predation deaths, mean energy,
+food eaten, and prey eaten.  At the end of the repeated run, it saves a
+final-seed energy analysis plot to
+\[
+\texttt{report/images/ecosystem/energy\_by\_shape\_orientation.png}.
+\]
+It also saves an aggregate repeated-seed ranking to
+\[
+\texttt{report/images/ecosystem/aggregate\_energy\_ranking.png}.
+\]
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{images/ecosystem/energy_by_shape_orientation.png}
+    \caption{Final creature energy grouped by evolved shape and orientation
+    bucket.  Blue bars show group mean energy; black dots show individual
+    creatures.}
+    \label{fig:ecosystem_energy_shape_orientation}
+\end{figure}
+
+The final-seed plot groups living creatures by shape and by the world-axis
+bucket corresponding to the body's local forward direction.  To estimate a more
+general ranking, option 6 aggregates all final creature energies from the
+repeated seeded runs and ranks shape-orientation groups by mean final energy.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{images/ecosystem/aggregate_energy_ranking.png}
+    \caption{Aggregate shape-orientation energy ranking across repeated
+    evolutionary simulations.  Bars show mean final energy across all living
+    creatures in the repeated-seed runs; error bars show standard error.}
+    \label{fig:ecosystem_aggregate_energy_ranking}
+\end{figure}
+
+This aggregate plot is the current approximation of a universal ranking for the
+chosen ecosystem settings.  It is still conditional on food density, guidance
+strength, predation rules, old-age parameters, obstacle layout, and number of
+seeds, but it is more robust than a single-run summary because the ranked groups
+are pooled across independent evolutionary histories.
+
+\section{Ecosystem Extension Conclusion}
+
+The ecosystem extension adds an evolutionary layer on top of the MuJoCo and
+fluid tank infrastructure.  Creatures now search for food, seek mates, reproduce
+through neural and morphological crossover, mutate into different body shapes,
+age, die, and in some cases become predators.  The implementation remains a
+hybrid model: MuJoCo renders the tank and creature bodies, while the ecosystem
+module owns energy, birth, death, selection, and behavior rules.  The
+Navier--Stokes field supplies the evolving fluid environment used by the
+rendered ecosystem mode.
+
+Future work should run repeated long simulations across seeds, export lineage
+trees, compare guided and unguided evolution, and quantify whether particular
+shape-orientation groups reliably outperform others under the same food,
+predation, and old-age settings.
+
 \end{document}
